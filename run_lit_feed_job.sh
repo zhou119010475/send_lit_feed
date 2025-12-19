@@ -9,12 +9,12 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-lit_feed}"
 REPO_ROOT="${REPO_ROOT:-/Users/wenjzhou/Documents/send_lit_feed}"
 
 # LitFeed email configuration (hardcoded for portability)
-export LIT_SMTP_HOST="smtp.gmail.com"
+export LIT_SMTP_HOST="smtp.example.com"
 export LIT_SMTP_PORT="587"
-export LIT_SMTP_USER="wenjiangz1123@gmail.com"
-export LIT_SMTP_PASS="llnqavomcnalftbd"
-export LIT_FROM="Wenjiang <wenjiangz1123@gmail.com>"
-export LIT_TO="wenjiang.zhou@ucsf.edu, peng.he@ucsf.edu, yuefei.zhu@ucsf.edu"
+export LIT_SMTP_USER="user@example.com"
+export LIT_SMTP_PASS="app-token"
+export LIT_FROM="Lit Feed <lit@example.com>"
+export LIT_TO="you@example.com, teammate@example.com"
 export LIT_SMTP_STARTTLS="1"
 export LIT_SUBJECT="[LITFeed] Recent Literature"
 
