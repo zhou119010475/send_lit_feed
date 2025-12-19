@@ -35,7 +35,7 @@ LOOKBACK_DAYS = 30
 MAX_ITEMS_PER_FEED = 200
 
 # Number of top papers to include in the digest
-TOP_K = 60
+TOP_K = 30
 
 # Number of top papers to optionally post to Slack
 TOP_K_SLACK = 15
@@ -63,8 +63,8 @@ FEEDS = [
     # bioRxiv – you should adjust to your preferred subject feeds.
     # Check biorxiv "RSS" page for more granular subjects if you want.
     {
-        "name": "bioRxiv Genomics+Bioinformatics",
-        "url": "https://connect.biorxiv.org/biorxiv_xml.php?subject=genomics+bioinformatics",
+        "name": "bioRxiv",
+        "url": "https://connect.biorxiv.org/biorxiv_xml.php?subject=all",
     },
 
     # Journals – many have RSS links in their “Alerts” or “RSS” pages.
@@ -72,6 +72,10 @@ FEEDS = [
     {
         "name": "Genome Research",
         "url": "https://genome.cshlp.org/rss/current.xml",
+    },
+    {
+        "name": "Genome Biology",
+        "url": "https://genomebiology.biomedcentral.com/rss/current.rss",
     },
     {
         "name": "Nature Genetics",
@@ -108,6 +112,10 @@ FEEDS = [
         "name": "PLOS Computational Biology",
         "url": "https://journals.plos.org/ploscompbiol/feed/atom",
     },
+    {
+        "name": "Nature Communications",
+        "url": "https://www.nature.com/ncomms.rss",
+    },
 ]
 
 # ---- Keyword filters ----
@@ -126,11 +134,24 @@ INCLUDE_KEYWORDS = [
     "phosphoproteomic",
     "chromatin accessibility",
     "ATAC-seq",
+    "scATAC-seq",
     "gene regulatory",
+    "gene regulation",
+    "GRN",
     "foundation model",
     "transformer",
-    "cardiomyopathy",
     "single cell"
+    "lung",
+    "kidney",
+    "limb",
+    "CPAM",
+    "organoid",
+    "neuroendocrine",
+    "multimodal",
+    "bioinformatics",
+    "computational biology",
+    "genomics",
+    "developmental biology",
 ]
 
 # If any of these appear, drop the item.
@@ -173,6 +194,24 @@ CANONICAL_PAPERS = [
         "title": "Tahoe-x1: scaling perturbation-trained single-cell foundation models. ",
         "summary": "Tx1 is pretrained on 200M+ perturbation-rich scRNA profiles and "
                    "fine-tuned for cancer-relevant prediction tasks."
+    },
+    {
+        "title": "The changing mouse embryo transcriptome at whole tissue and single-cell resolution",
+        "summary": "Cross-tissue bulk RNA-seq study of organogenesis"
+                   "Rest/NRSF regulated H3K27me3 de-repression; House-keeping gene transcriptional and post-transcriptional regulation"
+                   "scRNA-seq of mouse limb development; Gene regulatory network inference from multi-omic sequencing data."
+    },
+    {
+        "title": "A human fetal lung cell atlas uncovers proximal-distal gradients of differentiation and key regulators of epithelial fates",
+        "summary": "Comprehensive map of 144 human fetal lung cell populations; scRNA-seq and scATAC-seq"
+    },
+    {
+        "title": "A human embryonic limb cell atlas resolved in space and time",
+        "summary": "Spatiotemporal mapping of human limb development using scRNA-seq and Visium"
+    },
+    {
+        "title": "Early human lung immune cell development and its role in epithelial cell fate",
+        "summary": "Temporal single-cell mapping of immune cells in the lung; scBCR/abTCR/gdTCR-seq and lymphoid lineage inference"
     },
 ]
 
