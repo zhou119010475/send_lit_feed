@@ -35,11 +35,7 @@ LOOKBACK_DAYS = 30
 MAX_ITEMS_PER_FEED = 200
 
 # Number of top papers to include in the digest
-TOP_K = 60
-
-TODAY_TOP_K = 40
-PREV_TOP_K = 30
-TODAY_MIN_SCORE = 0.30
+TOP_K = 30
 
 # Number of top papers to optionally post to Slack
 TOP_K_SLACK = 15
@@ -67,8 +63,8 @@ FEEDS = [
     # bioRxiv – you should adjust to your preferred subject feeds.
     # Check biorxiv "RSS" page for more granular subjects if you want.
     {
-        "name": "bioRxiv Genomics+Bioinformatics",
-        "url": "https://connect.biorxiv.org/biorxiv_xml.php?subject=genomics+bioinformatics",
+        "name": "bioRxiv",
+        "url": "https://connect.biorxiv.org/biorxiv_xml.php?subject=all",
     },
 
     # Journals – many have RSS links in their “Alerts” or “RSS” pages.
@@ -76,6 +72,10 @@ FEEDS = [
     {
         "name": "Genome Research",
         "url": "https://genome.cshlp.org/rss/current.xml",
+    },
+    {
+        "name": "Genome Biology",
+        "url": "https://genomebiology.biomedcentral.com/rss/current.rss",
     },
     {
         "name": "Nature Genetics",
@@ -111,6 +111,10 @@ FEEDS = [
     {
         "name": "PLOS Computational Biology",
         "url": "https://journals.plos.org/ploscompbiol/feed/atom",
+    },
+    {
+        "name": "Nature Communications",
+        "url": "https://www.nature.com/ncomms.rss",
     },
 ]
 
@@ -309,78 +313,21 @@ def most_recent_non_today_digest_path(output_dir: str) -> str | None:
             return p
     return None
 
-_KEYS_BLOB_RE = re.compile(r"<!--\s*DIGEST_KEYS_JSON\s*(.*?)\s*-->", re.DOTALL)
+_KEYS_BLOB_RE = re.compile(r"<!--\s*DIGEST_KEYS_JSON\s*(\{.*?\})\s*-->", re.DOTALL)
 
-def load_papers_from_html(path: str) -> List[Paper]:
-    """
-    Load papers from a prior digest.
-
-    Supports two formats:
-      (A) JSON blob contains {"papers":[...]}  (new format)
-      (B) JSON blob contains {"keys":[...]}    (old format) -> fallback: parse HTML cards
-    """
+def load_keys_from_html(path: str) -> set[str]:
+    """Read prior digest HTML and recover the set of paper keys stored in it."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             html = f.read()
-
         m = _KEYS_BLOB_RE.search(html)
-        payload = json.loads(m.group(1)) if m else {}
-
-        # (A) Preferred: structured papers in JSON blob
-        if isinstance(payload, dict) and isinstance(payload.get("papers"), list):
-            out: List[Paper] = []
-            for d in payload["papers"]:
-                dt = datetime.fromisoformat(d["published"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                out.append(Paper(
-                    title=d.get("title", ""),
-                    summary=d.get("summary", ""),
-                    link=d.get("link", ""),
-                    published=dt,
-                    source=d.get("source", ""),
-                    score=float(d["score"]) if d.get("score") is not None else math.nan,
-                ))
-            return [p for p in out if p.title]
-
-        # (B) Fallback: parse the rendered HTML cards (works for your 01-04 file)
-        card_re = re.compile(
-            r'<div class="paper">.*?'
-            r'<h3><a href="(?P<link>[^"]+)".*?>\s*(?P<title>.*?)\s*</a></h3>.*?'
-            r'Source:\s*<strong>(?P<source>.*?)</strong>\s*·.*?'
-            r'Date:\s*(?P<date>\d{4}-\d{2}-\d{2}).*?'
-            r'Relevance score:\s*(?P<score>[\d.]+|n/a).*?'
-            r'<div class="summary">(?P<summary>.*?)</div>.*?'
-            r'</div>',
-            re.DOTALL
-        )
-
-        out: List[Paper] = []
-        for m in card_re.finditer(html):
-            title = strip_html(m.group("title")).strip()
-            link = strip_html(m.group("link")).strip()
-            source = strip_html(m.group("source")).strip()
-            date_str = strip_html(m.group("date")).strip()
-            score_str = strip_html(m.group("score")).strip()
-            summary = strip_html(m.group("summary")).strip()
-
-            published = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-            score = float(score_str) if score_str != "n/a" else math.nan
-
-            if title:
-                out.append(Paper(
-                    title=title,
-                    summary=summary,
-                    link=link,
-                    published=published,
-                    source=source,
-                    score=score,
-                ))
-        return out
-
+        if not m:
+            return set()
+        payload = json.loads(m.group(1))
+        keys = payload.get("keys", [])
+        return set(keys) if isinstance(keys, list) else set()
     except Exception:
-        return []
-
+        return set()
 
 def split_new_vs_previous(papers_ranked: List[Paper], seen_keys: set[str]) -> tuple[List[Paper], List[Paper]]:
     new_items, prev_items = [], []
@@ -501,7 +448,7 @@ def save_markdown(md: str) -> str:
     print(f"Saved digest to {path}")
     return path
 
-def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper], history_papers: List[Paper]) -> str:
+def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper]) -> str:
     """Return a full HTML document string with two sections:
     - Today's Feed: new since last digest
     - Previous Feed: already seen in last digest
@@ -637,19 +584,8 @@ def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper], history
     )
 
     # Embed keys so next run can read them back
-    def _paper_to_dict(p: Paper) -> dict:
-        return {
-            "title": p.title,
-            "summary": p.summary,
-            "link": p.link,
-            "published": p.published.astimezone(timezone.utc).isoformat(),
-            "source": p.source,
-            "score": p.score,
-        }
-    
-    payload = {"papers": [_paper_to_dict(p) for p in history_papers]}
-
-    keys_blob = f"<!-- DIGEST_KEYS_JSON {json.dumps(payload)} -->"
+    all_keys = [paper_key(p) for p in (new_papers + prev_papers)]
+    keys_blob = f"<!-- DIGEST_KEYS_JSON {json.dumps({'keys': all_keys})} -->"
 
     body = header + todays_html + prev_html + keys_blob
 
@@ -731,77 +667,23 @@ def main():
         print("No papers found after filtering.")
         return
 
-    # ranked = rank_papers(all_papers)
-    # ranked = ranked[:TOP_K]
+    ranked = rank_papers(all_papers)
+    ranked = ranked[:TOP_K]
     
     # Load keys from most recent prior digest (if any)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_date = datetime.now(timezone.utc).date()
     
     # Path we will write to (overwrite if exists)
     today_path = os.path.join(OUTPUT_DIR, f"digest_{today}.html")
     
-    # Use the most recent NON-today digest as the accumulated history baseline
-    prev_path = most_recent_non_today_digest_path(OUTPUT_DIR)
-    prev_papers = load_papers_from_html(prev_path) if prev_path else []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-    prev_papers = [p for p in prev_papers if p.published >= cutoff]
-    seen_keys = {paper_key(p) for p in prev_papers}
+    # For splitting: ONLY compare against the most recent NON-today digest
+    prev_non_today = most_recent_non_today_digest_path(OUTPUT_DIR)
+    seen_keys = load_keys_from_html(prev_non_today) if prev_non_today else set()
     
-    yesterday_date = today_date - timedelta(days=1)
-    desired_dates = {today_date, yesterday_date}
-    # Define "Today's feed" strictly by published date (UTC)
-    today_keys = {
-        paper_key(p)
-        for p in all_papers
-        if p.published.date() in desired_dates
-    }
+    new_items, prev_items = split_new_vs_previous(ranked, seen_keys)
     
-    # Merge today's RSS papers with accumulated previous papers, then dedup by key
-    merged = {}
-    for p in (all_papers + prev_papers):
-        merged[paper_key(p)] = p
-    merged_papers = list(merged.values())
-    
-    # Rank the merged set
-    ranked = rank_papers(merged_papers)
-    
-    # Split AFTER ranking, but keep accumulated previous even if not in today's RSS
-    new_items, prev_items = [], []
-    has_history = bool(prev_papers)  # i.e., we found a prior digest
-    
-    for p in ranked:
-        k = paper_key(p)
-    
-        # 1) Today's Feed: published today AND not seen before
-        if (k in today_keys) and (k not in seen_keys):
-            new_items.append(p)
-            continue
-    
-        # 2) Previous Feed: anything already seen, OR (on first run) anything not from today
-        if (k in seen_keys) or (not has_history and p.published.date() != today_date):
-            prev_items.append(p)
-
-    # Apply relevance threshold to Today's feed
-    new_items = [p for p in new_items if (not math.isnan(p.score)) and (p.score >= TODAY_MIN_SCORE)]
-    
-    # Cap separately
-    new_items = new_items[:TODAY_TOP_K]
-    prev_items = prev_items[:PREV_TOP_K]
-    
-    # "history_papers" should be everything you want to remember:
-    # previous history + anything you've ever shown today (today + previous candidates)
-    history_dedup = {}
-    for p in (prev_papers + all_papers):
-        history_dedup[paper_key(p)] = p
-    history_papers = list(history_dedup.values())
-    
-    html = build_html_digest(new_items, prev_items, history_papers)
-    
-    # overwrite today's file (your existing overwrite logic)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_path = os.path.join(OUTPUT_DIR, f"digest_{today}.html")
+    html = build_html_digest(new_items, prev_items)
     save_html(html, path=today_path)
     
     # For Slack: usually you want only the NEW items; change if you want both.
