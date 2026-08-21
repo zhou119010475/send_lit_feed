@@ -204,18 +204,6 @@ FEEDS = [
         "name": "PLOS Computational Biology",
         "url": "https://journals.plos.org/ploscompbiol/feed/atom",
     },
-    {
-        "name": "Blood",
-        "url": "https://ashpublications.org/blood/rss/mostrecent",
-    },
-    {
-        "name": "Blood Advances",
-        "url": "https://ashpublications.org/bloodadvances/rss/mostrecent",
-    },
-    {
-        "name": "Blood Red Cells & Iron",
-        "url": "https://ashpublications.org/bloodredcellsiron/rss/mostrecent",
-    },
 
     # preprints.org (MDPI Preprints). Read through Crossref rather than RSS:
     # every preprints.org RSS endpoint answers 403 to scripted clients, while
