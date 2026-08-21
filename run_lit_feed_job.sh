@@ -28,6 +28,10 @@ export LIT_TO="wenjiang.zhou@ucsf.edu, peng.he@ucsf.edu, yuefei.zhu@ucsf.edu, Ko
 export LIT_SMTP_STARTTLS="1"
 export LIT_SUBJECT="[LITFeed] Recent Literature"
 
+# Identifies us to Crossref (used for the preprints.org feed) so it places us in
+# its faster, "polite" rate-limit pool instead of the anonymous one.
+export LIT_CROSSREF_EMAIL="wenjiangz1123@gmail.com"
+
 # Activate conda
 if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
     # shellcheck source=/dev/null
@@ -43,12 +47,16 @@ conda activate "${CONDA_ENV_NAME}"
 cd "${REPO_ROOT}"
 python lit_feed.py
 
-# Send the freshest digest that was just generated
-LATEST_HTML="$(ls -1t digests/digest_*.html 2>/dev/null | head -n1 || true)"
-if [ -z "${LATEST_HTML}" ]; then
-    echo "No digest HTML found in ${REPO_ROOT}/digests"
+# lit_feed.py writes two files per run: an archive copy (digest_YYYY-MM-DD.html,
+# carries the history blob future runs read back) and an email-shaped copy
+# (digest_YYYY-MM-DD.email.html, sized to avoid Gmail's ~102KB clipping limit).
+# Mail the latter, keyed off UTC to match how lit_feed.py names the file.
+TODAY_UTC="$(date -u +%Y-%m-%d)"
+EMAIL_HTML="digests/digest_${TODAY_UTC}.email.html"
+if [ ! -f "${EMAIL_HTML}" ]; then
+    echo "No email-ready digest found at ${REPO_ROOT}/${EMAIL_HTML}"
     exit 1
 fi
 
-python send_digest_html.py "${LATEST_HTML}"
+python send_digest_html.py "${EMAIL_HTML}"
 
