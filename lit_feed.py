@@ -3,28 +3,55 @@
 Recent literature digest for arXiv / bioRxiv / journals.
 
 - Fetches RSS feeds (and Crossref, for servers that block scripted clients)
-- Filters by keywords
-- Ranks by semantic similarity to canonical papers
+- Applies profile-specific domain and keyword filters
+- Shortlists by seed-paper similarity and optionally judges with an LLM
 - Writes Markdown digest
 - Optionally posts top-N to Slack via incoming webhook
 
 Configurable in the CONFIG section below.
 """
 
-import os
+import argparse
+import glob
+import json
 import math
+import os
 import re
 import textwrap
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import feedparser
 import requests
 import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
+
+
+def _load_local_env() -> None:
+    """Load simple KEY=VALUE settings from the ignored .env beside this script."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.removeprefix("export ").split("=", 1)
+            key, value = key.strip(), value.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+_load_local_env()
 
 
 # ==========================
@@ -47,43 +74,27 @@ CROSSREF_ROWS = 500
 CROSSREF_PAUSE_SEC = 1.0
 CROSSREF_RETRIES = 4
 
-# A paper is admitted to the digest if it matches an include keyword OR the ranker
-# puts it at least this close to your seed papers. Keyword matching is brittle --
-# "multiomic data" matches none of "multi-omic"/"multi omic"/"multiomics" -- so this
-# second route is what catches on-topic work that happens not to use your vocabulary.
-# Deliberately set high. Measured on one day of 1205 papers, this route admits
-# roughly 7 extra papers at 0.50, 20 at 0.45 and 41 at 0.40 -- but at 0.40 most of
-# the additions were machine-learning papers with no biology (solid mechanics,
-# cerebellar models, ECG classification), and because every one of them outscored
-# the MEDIAN keyword match they crowded genuine hits out of the TODAY_TOP_K slots.
-#
-# The bar is high because the seed list is short. Five seeds of a title plus one
-# sentence cannot separate "transformer applied to single cells" from "transformer
-# applied to anything", so generic ML scores well. Longer, more numerous seeds are
-# what buys the room to lower this -- see CANONICAL_PAPERS.
-#
-# Set to 0 to disable the semantic route and go back to keywords alone.
-# Measured against a real day's pool of 1115 papers rather than guessed. Expanding the
-# seed list from 5 short entries to 22 real abstracts did NOT widen the gap between
-# on-topic and off-topic papers -- it narrowed it, from +0.173 to +0.155. Richer seeds
-# lifted the off-topic median (+0.023) more than the on-topic one (+0.006), because the
-# method-and-tooling vocabulary the new seeds carry also describes generic
-# bioinformatics papers, which is most of what Bioinformatics and PLOS Comp Biol
-# publish. The seeds did sharpen the top end -- a spatial multiomic integration paper
-# went 0.474 -> 0.634 -- so the fix is a higher bar, not a lower one.
-#
-# What each bar admits per day, non-keyword papers only:
-#   0.40 -> 65    0.45 -> 35    0.47 -> 24    0.50 -> 16    0.55 -> 5    0.60 -> 1
-# By eye, quality falls off below about 0.55: at 0.50 the list picks up survival
-# prediction, tsRNA-disease association and barcode mappers. 0.55 keeps roughly five a
-# day and the genuinely on-topic ones sit comfortably above it.
-#
-# Set to 0 to disable the semantic route and use keywords alone.
-SEMANTIC_ADMIT_SCORE = 0.55
+# A new paper enters the high-recall shortlist if it matches an include keyword or
+# reaches this seed-similarity score. A separate 0.40 hard floor applies first. The
+# biological-domain gate removes generic keyword coincidences, and the optional LLM
+# judge then applies the profile's compound scientific intent. Set this to 0 to use
+# keywords as the only route into that shortlist.
+# Re-derived 2026-08-26 on 745 labelled papers at max_seq_length=512, fitted on
+# the training split for precision >= 0.90: held-out precision 0.964, recall 0.762.
+# Governs admission WITHOUT an include-keyword match, so keyword hits still
+# recover papers this rejects.
+SEMANTIC_ADMIT_SCORE = 0.62
 
-# Abstract length in the emailed copy. Cards end up within a line of each other at
-# this width, which is what keeps the message scannable; the archive copy keeps the
-# longer 1200-character version.
+# Abstract length in the emailed copy only. Cards end up within a line of each other
+# at this width, which is what keeps the message scannable. The archive copy in
+# digests/ keeps full abstracts -- it is read in a browser, where length is free.
+#
+# LOCAL: upstream removed this in ac4de18 and now emails full abstracts, accepting
+# that "very long messages may be clipped by the mail client". We cannot: Gmail
+# clips at ~102KB and shows a "[Message clipped]" stub, which is the exact failure
+# the previous sync introduced this constant to fix. Measured on the 2026-08-27 dev
+# run, 40 cards with full abstracts came to 130KB (60KB of abstract, median 1548
+# characters each) against 77KB truncated. Restored deliberately.
 EMAIL_ABSTRACT_CHARS = 300
 
 # Number of top papers to include in the digest
@@ -93,18 +104,41 @@ TODAY_TOP_K = 40
 PREV_TOP_K = 30
 # Hard relevance floor for every paper in the digest. Keyword matches do not bypass
 # it; papers above this floor still need a keyword match or SEMANTIC_ADMIT_SCORE.
-# Kept at our prior 0.30 (upstream defaults to 0.40) -- our INCLUDE_KEYWORDS list
-# covers organ-development terms (lung/kidney/limb/atlas/...) that sit further from
-# the cardiovascular- and foundation-model-heavy seed groups, so a stricter floor
-# risked dropping on-topic papers before the new seed group below had a chance to
-# pull their score up.
+# Re-derived at max_seq_length=512: retains 99% of labelled wanted papers
+# (loses 3/253) while rejecting 72/125 unwanted, against 49/125 at the old 0.40.
+#
+# LOCAL: upstream ships 0.465; we stay at 0.30. Two things were checked before
+# keeping it, by re-scoring the 465 papers stored in digest_2026-08-25.html --
+# written by the old code, so every paper has a paired old and new score.
+#
+#   1. Is 0.30 still the same bar? Yes. max_seq_length 256 -> 512 plus upstream's
+#      reshuffled seed groups moved scores by a median of -0.005 (mean -0.012),
+#      and papers that had scored just above the old floor re-score at a median
+#      0.314. The distribution barely moved, so 0.30 keeps meaning what it meant.
+#   2. Would upstream's 0.465 work for us? No. It cuts 65% of what this feed
+#      currently carries, because our INCLUDE_KEYWORDS reach into organ and
+#      lineage development (lung/kidney/limb/hematopoietic/atlas), which sits
+#      further from upstream's cardiovascular- and foundation-model-heavy seeds
+#      than the work their threshold was fitted on.
+#
+# The generic-ML noise upstream raised the floor to remove is removed here by the
+# domain gate instead -- see DOMAIN_KEYWORDS, which drops 38% of this same pool.
 TODAY_MIN_SCORE = 0.30
 
-# Number of top papers to optionally post to Slack
+# Number of top papers to optionally post to Slack. Upstream dropped this constant
+# in ac4de18 but left post_to_slack() referencing it; keep it so the Slack path is
+# a no-op rather than a NameError if LIT_DIGEST_SLACK_WEBHOOK is ever set.
 TOP_K_SLACK = 15
 
 # Keep output beside this script so cron and interactive runs use the same history.
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "digests")
+# The default profile continues to use this directory directly. Additional profiles
+# get their own subdirectory, preventing one audience's seen-paper history from
+# suppressing another audience's results.
+OUTPUT_ROOT = os.getenv(
+    "LIT_FEED_OUTPUT_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "digests"),
+)
+OUTPUT_DIR = OUTPUT_ROOT
 
 # Optional Slack incoming webhook URL (set as env var or paste string here)
 SLACK_WEBHOOK_URL = os.getenv("LIT_DIGEST_SLACK_WEBHOOK", "").strip()
@@ -277,6 +311,11 @@ INCLUDE_KEYWORDS = [
     # models
     "foundation model",   # substring also covers foundation models
     "transformer",
+    "deep learning",
+    "deep-learning",
+    "neural network",
+    "virtual cell",
+    "virtual-cell",
 
     # cardiovascular
     "cardiomyopathy",
@@ -333,6 +372,7 @@ TAGS = [
     ("chromatin",        "#E69F00", ["chromatin accessibility", "ATAC-seq"]),
     ("gene regulation",  "#56B4E9", ["gene regulatory"]),
     ("foundation model", "#3B3B3B", ["foundation model", "transformer"]),
+    ("virtual cell",     "#6F4C9B", ["virtual cell", "virtual-cell"]),
     ("cardiac",          "#A0132B", ["cardiomyopathy"]),
 ]
 
@@ -383,18 +423,6 @@ CANONICAL_PAPERS = [
                    "hearts harbours a unique activated fibroblast population probed by "
                    "CRISPR knockout screening.",
         # 10.1038/s41586-022-04817-8
-    },
-    {
-        "group": "cardiovascular single-cell",
-        "title": "Spatial multi-omic map of human myocardial infarction",
-        "summary": "An integrative high-resolution map of human cardiac remodelling after "
-                   "myocardial infarction built from single-cell gene expression, chromatin "
-                   "accessibility and spatial transcriptomic profiling of multiple "
-                   "physiological zones and time points. Multi-modal data integration "
-                   "resolves cardiac cell-type composition and identifies disease-specific "
-                   "cell states and distinct tissue structures of injury, repair and "
-                   "remodelling in their spatial context.",
-        # 10.1038/s41586-022-05060-x
     },
     {
         "group": "cardiovascular single-cell",
@@ -460,6 +488,18 @@ CANONICAL_PAPERS = [
         "title": "Tahoe-x1: scaling perturbation-trained single-cell foundation models",
         "summary": "Tx1 is pretrained on 200M+ perturbation-rich scRNA profiles and "
                    "fine-tuned for cancer-relevant prediction tasks.",
+    },
+    {
+        "group": "single-cell foundation models",
+        "title": "Novae: a graph-based foundation model for spatial transcriptomics data",
+        "summary": "Spatial transcriptomics gives high-resolution insight into gene "
+                   "expression within the spatial context of tissues, essential for "
+                   "identifying spatial domains and microenvironment organization. Novae is "
+                   "a graph-based foundation model that extracts representations of cells "
+                   "within their spatial contexts, enabling zero-shot domain inference "
+                   "across gene panels, tissues and technologies, batch-effect correction "
+                   "and a nested hierarchy of spatial domains.",
+        # 10.1038/s41592-025-02899-6
     },
     # ---- perturbation prediction -----------------------------------
     {
@@ -545,42 +585,6 @@ CANONICAL_PAPERS = [
                    "resolution.",
         # 10.1038/s41587-023-01935-0
     },
-    # ---- spatial transcriptomics -----------------------------------
-    {
-        "group": "spatial transcriptomics",
-        "title": "Cell2location maps fine-grained cell types in spatial transcriptomics",
-        "summary": "Spatial transcriptomic technologies promise to resolve cellular wiring "
-                   "diagrams of tissues, but comprehensive mapping of cell types in situ "
-                   "remains a challenge. cell2location is a Bayesian model that resolves "
-                   "fine-grained cell types in spatial transcriptomic data, accounting for "
-                   "technical variation and borrowing statistical strength across locations "
-                   "to integrate single-cell and spatial transcriptomics with higher "
-                   "sensitivity and resolution.",
-        # 10.1038/s41587-021-01139-4
-    },
-    {
-        "group": "spatial transcriptomics",
-        "title": "Novae: a graph-based foundation model for spatial transcriptomics data",
-        "summary": "Spatial transcriptomics gives high-resolution insight into gene "
-                   "expression within the spatial context of tissues, essential for "
-                   "identifying spatial domains and microenvironment organization. Novae is "
-                   "a graph-based foundation model that extracts representations of cells "
-                   "within their spatial contexts, enabling zero-shot domain inference "
-                   "across gene panels, tissues and technologies, batch-effect correction "
-                   "and a nested hierarchy of spatial domains.",
-        # 10.1038/s41592-025-02899-6
-    },
-    {
-        "group": "spatial transcriptomics",
-        "title": "Slide-tags enables single-nucleus barcoding for multimodal spatial genomics",
-        "summary": "High-throughput single-cell transcriptomic and epigenomic assays lack "
-                   "routine spatial localization of the profiled cells. Slide-tags tags "
-                   "single nuclei within an intact tissue section using spatial barcode "
-                   "oligonucleotides from DNA-barcoded beads of known position, giving "
-                   "sub-10 micron resolution whole-transcriptome data and enabling multiomic "
-                   "measurement of open chromatin, RNA and TCR in the same cells.",
-        # 10.1038/s41586-023-06837-4
-    },
     # ---- gene regulation and chromatin -----------------------------
     {
         "group": "gene regulation and chromatin",
@@ -635,6 +639,78 @@ CANONICAL_PAPERS = [
 ]
 
 
+# ---- Feed profiles ---------------------------------------------------------
+# A profile is the complete definition of one audience. To add another feed, copy
+# this entry, give it a unique key/output_subdir, and provide that audience's
+# keywords, seed groups, and relevance rubric. Run it with --profile NAME. Keeping
+# the configuration in this tracked script lets the repository remain a two-file
+# tool while each profile's generated history stays local and separate.
+DEFAULT_PROFILE_NAME = "single_cell_ml"
+
+DOMAIN_KEYWORDS = [
+    "single-cell", "single cell", "single-nucleus", "single nucleus",
+    "scrna", "snrna", "scatac", "snatac", "perturb-seq",
+    "spatial transcriptomic", "spatial omic", "spatially resolved transcript",
+    "multi-omic", "multi omic", "multiomic", "multiome", "cite-seq",
+    "chromatin accessibility", "open chromatin", "gene regulatory",
+    "gene expression", "transcriptomic", "cell atlas", "cell state",
+    "cardiomyopathy", "heart failure", "cardiac",
+    "virtual cell", "virtual-cell",
+
+    # LOCAL: this gate only ever REMOVES papers, so every biological term we admit
+    # on in INCLUDE_KEYWORDS has to appear here too or the gate silently undoes it.
+    # Upstream's list is cardiovascular- and assay-centric; ours also covers organ
+    # and lineage development, which is most of what our extra bioRxiv subject
+    # feeds carry. Deliberately NOT mirrored from INCLUDE_KEYWORDS: "multimodal"
+    # (an ML term as often as a biological one -- letting it through would defeat
+    # the generic-ML rejection this gate exists for) and bare "atlas" (a genuine
+    # cell atlas already matches "cell atlas", or its organ term below).
+    "lung", "kidney", "limb", "hematopoietic", "hematopoiesis",
+    "organoid", "organogenesis", "CPAM", "neuroendocrine",
+    "developmental biology", "embryo", "fetal", "morphogenesis",
+    "genomics", "bioinformatics", "computational biology",
+
+    # LOCAL: molecular-biology vocabulary, added after measuring the gate against
+    # one real digest (465 papers). Upstream's list is phrased around assay names,
+    # so it dropped genuine gene-regulation and development work that simply names
+    # the biology instead -- an enhancer-promoter hub paper, a collective cell
+    # migration paper, a "cellular atlas" that never says "cell atlas". These terms
+    # have no machine-learning reading, so they recover that work without letting
+    # the EHR/imaging/remote-sensing papers back in. Note "differentiation" is
+    # absent on purpose: automatic differentiation is an ML term.
+    "cellular atlas", "cell fate", "cell type", "cell differentiation",
+    "transcription factor", "enhancer", "promoter", "regulatory element",
+    "epigenom", "lineage", "rna-seq", "atac-seq", "chip-seq",
+]
+
+PROFILES = {
+    DEFAULT_PROFILE_NAME: {
+        "display_name": "Single-Cell ML",
+        "output_subdir": "",  # preserve the existing cron and digest history
+        # Unused since upstream ac4de18 removed the LLM judge; kept as the written
+        # statement of what this feed is for.
+        "description": (
+            "Deep-learning model development, evaluation, and representation learning for "
+            "single-cell or multi-omics data, perturbation prediction, and virtual-cell "
+            "modeling are the primary interests. Biological or mechanistic studies that "
+            "mainly use an omics assay are background priority; cardiovascular disease is "
+            "the favored application area. LOCAL: single-cell and multi-omic studies of "
+            "organ and lineage development -- lung, kidney, limb and hematopoiesis, "
+            "including developmental cell atlases -- are a first-class interest here, not "
+            "background."
+        ),
+        "include_keywords": INCLUDE_KEYWORDS,
+        "domain_keywords": DOMAIN_KEYWORDS,
+        "exclude_keywords": EXCLUDE_KEYWORDS,
+        "tags": TAGS,
+        "canonical_papers": CANONICAL_PAPERS,
+    },
+}
+
+ACTIVE_PROFILE_NAME = DEFAULT_PROFILE_NAME
+ACTIVE_PROFILE = PROFILES[DEFAULT_PROFILE_NAME]
+
+
 # Sentence-transformer model (small but decent)
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -653,6 +729,8 @@ class Paper:
     source: str
     score: float = math.nan  # semantic similarity score (filled later)
     authors: List[str] = field(default_factory=list)
+    semantic_group: str = ""
+
 
 
 # ==========================
@@ -777,6 +855,27 @@ def format_authors(authors: List[str], max_shown: int = 3) -> str:
     return f"{clean[0]}, …, {clean[-1]}"
 
 
+def activate_profile(name: str) -> dict:
+    """Activate one named audience without mixing its output/history with another."""
+    if name not in PROFILES:
+        choices = ", ".join(sorted(PROFILES))
+        raise ValueError(f"Unknown profile {name!r}; choose one of: {choices}")
+
+    global ACTIVE_PROFILE_NAME, ACTIVE_PROFILE
+    global INCLUDE_KEYWORDS, EXCLUDE_KEYWORDS, TAGS, CANONICAL_PAPERS, OUTPUT_DIR
+
+    profile = PROFILES[name]
+    ACTIVE_PROFILE_NAME = name
+    ACTIVE_PROFILE = profile
+    INCLUDE_KEYWORDS = profile["include_keywords"]
+    EXCLUDE_KEYWORDS = profile["exclude_keywords"]
+    TAGS = profile["tags"]
+    CANONICAL_PAPERS = profile["canonical_papers"]
+    subdir = profile.get("output_subdir", name)
+    OUTPUT_DIR = os.path.join(OUTPUT_ROOT, subdir) if subdir else OUTPUT_ROOT
+    return profile
+
+
 def is_excluded(paper: Paper) -> bool:
     """Hard veto. Applied at fetch time, before anything is embedded."""
     if not EXCLUDE_KEYWORDS:
@@ -793,16 +892,26 @@ def matches_include_keywords(paper: Paper) -> bool:
     return any(k.lower() in text for k in INCLUDE_KEYWORDS)
 
 
+def matches_domain_keywords(paper: Paper) -> bool:
+    """High-recall biological gate applied before semantic ranking.
+
+    This keeps generic uses of terms such as "foundation model", "transformer",
+    and "perturbation" out of the ranked pool. It is the stage that rejects
+    ordinary machine-learning papers: measured pairwise separation of omics model
+    work from generic ML is 0.954, so the finer distinction between a relevant
+    model paper and a descriptive analysis is left to the seed-group similarity.
+    """
+    keywords = ACTIVE_PROFILE.get("domain_keywords", [])
+    if not keywords:
+        return True
+    text = f"{paper.title} {paper.summary}".lower()
+    return any(k.lower() in text for k in keywords)
+
+
 def passes_keyword_filters(paper: Paper) -> bool:
     """Both keyword tests at once. Kept for callers that want the old behaviour."""
     return matches_include_keywords(paper) and not is_excluded(paper)
 
-
-import json
-import glob
-import re  # noqa: F811  (already imported at the top; kept for clarity here)
-from html import escape
-from urllib.parse import urlsplit, urlunsplit
 
 def canonicalize_url(url: str) -> str:
     """Normalize URLs so trivial differences don't create new IDs."""
@@ -843,6 +952,37 @@ def most_recent_non_today_digest_path(output_dir: str) -> str | None:
 
 _KEYS_BLOB_RE = re.compile(r"<!--\s*DIGEST_KEYS_JSON\s*(.*?)\s*-->", re.DOTALL)
 
+
+def _paper_from_dict(data: dict) -> Paper:
+    dt = datetime.fromisoformat(data["published"])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return Paper(
+        title=data.get("title", ""),
+        summary=data.get("summary", ""),
+        link=data.get("link", ""),
+        published=dt,
+        source=data.get("source", ""),
+        score=float(data["score"]) if data.get("score") is not None else math.nan,
+        # Older digests predate this field; absent means "unknown", not "no authors".
+        authors=list(data.get("authors") or []),
+        semantic_group=data.get("semantic_group", ""),
+    )
+
+
+def _digest_payload(html: str) -> dict:
+    match = _KEYS_BLOB_RE.search(html)
+    payload = json.loads(match.group(1)) if match else {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _papers_from_payload(payload: dict, field_name: str) -> Optional[List[Paper]]:
+    records = payload.get(field_name)
+    if not isinstance(records, list):
+        return None
+    papers = [_paper_from_dict(record) for record in records]
+    return [paper for paper in papers if paper.title]
+
 def load_papers_from_html(path: str) -> List[Paper]:
     """
     Load papers from a prior digest.
@@ -855,28 +995,12 @@ def load_papers_from_html(path: str) -> List[Paper]:
         with open(path, "r", encoding="utf-8") as f:
             html = f.read()
 
-        m = _KEYS_BLOB_RE.search(html)
-        payload = json.loads(m.group(1)) if m else {}
+        payload = _digest_payload(html)
 
         # (A) Preferred: structured papers in JSON blob
-        if isinstance(payload, dict) and isinstance(payload.get("papers"), list):
-            out: List[Paper] = []
-            for d in payload["papers"]:
-                dt = datetime.fromisoformat(d["published"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                out.append(Paper(
-                    title=d.get("title", ""),
-                    summary=d.get("summary", ""),
-                    link=d.get("link", ""),
-                    published=dt,
-                    source=d.get("source", ""),
-                    score=float(d["score"]) if d.get("score") is not None else math.nan,
-                    # Older digests predate this field; absent means "unknown",
-                    # not "no authors".
-                    authors=list(d.get("authors") or []),
-                ))
-            return [p for p in out if p.title]
+        structured = _papers_from_payload(payload, "papers")
+        if structured is not None:
+            return structured
 
         # (B) Fallback: parse the rendered HTML cards (works for your 01-04 file)
         card_re = re.compile(
@@ -884,7 +1008,7 @@ def load_papers_from_html(path: str) -> List[Paper]:
             r'<h3><a href="(?P<link>[^"]+)".*?>\s*(?P<title>.*?)\s*</a></h3>.*?'
             r'Source:\s*<strong>(?P<source>.*?)</strong>\s*·.*?'
             r'Date:\s*(?P<date>\d{4}-\d{2}-\d{2}).*?'
-            r'Relevance score:\s*(?P<score>[\d.]+|n/a).*?'
+            r'(?:Relevance|Semantic) score:\s*(?P<score>[\d.]+|n/a).*?'
             r'<div class="summary">(?P<summary>.*?)</div>.*?'
             r'</div>',
             re.DOTALL
@@ -1141,6 +1265,10 @@ def rank_papers(papers: List[Paper]) -> List[Paper]:
 
     print("Loading embedding model...")
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    # all-MiniLM-L6-v2 defaults to 256 wordpieces, which truncated 75% of the
+    # candidate abstracts (mean 119 tokens discarded) while leaving every seed
+    # intact. That asymmetry biased every similarity score.
+    model.max_seq_length = 512
 
     # Build canonical embedding
     # One direction per interest: average the seeds within a group, then score each
@@ -1168,10 +1296,14 @@ def rank_papers(papers: List[Paper]) -> List[Paper]:
     # cardiovascular seed sits 0.29-0.54 from its neighbours and 0.68 from the global
     # centroid, so cardiovascular papers were scored against a point dominated by the
     # foundation-model seeds.
-    sims = util.cos_sim(paper_emb, canon_emb).max(dim=1).values.cpu().numpy().reshape(-1)
+    similarity_matrix = util.cos_sim(paper_emb, canon_emb)
+    best = similarity_matrix.max(dim=1)
+    scores = best.values.cpu().numpy().reshape(-1)
+    group_names = list(groups)
 
-    for p, s in zip(papers, sims):
+    for p, s, group_index in zip(papers, scores, best.indices.tolist()):
         p.score = float(s)
+        p.semantic_group = group_names[group_index]
 
     # Sort by score descending, then by recency
     papers_sorted = sorted(
@@ -1182,16 +1314,22 @@ def rank_papers(papers: List[Paper]) -> List[Paper]:
     return papers_sorted
 
 
+def sort_for_profile(papers: List[Paper]) -> List[Paper]:
+    """Order by similarity to the closest seed group, then recency."""
+    return sorted(papers, key=lambda p: (p.score, p.published), reverse=True)
+
+
 def format_paper_md(p: Paper) -> str:
     date_str = p.published.astimezone(timezone.utc).strftime("%Y-%m-%d")
     score_str = f"{p.score:.3f}" if not math.isnan(p.score) else "n/a"
     summary = p.summary or "_No abstract/summary available._"
-    summary = textwrap.shorten(summary, width=600, placeholder="…")
+    interest = p.semantic_group or "unassigned"
+    priority = ""
 
     return textwrap.dedent(f"""
     ### [{p.title}]({p.link})
-    - Source: **{p.source}**
-      Date: {date_str} · Relevance score: {score_str}
+    - Source: **{p.source}**  
+      Date: {date_str} · Semantic score: {score_str} · Interest: {interest}{priority}
 
     {summary}
     """)
@@ -1199,12 +1337,16 @@ def format_paper_md(p: Paper) -> str:
 
 def build_markdown_digest(papers: List[Paper]) -> str:
     now = datetime.now(timezone.utc)
-    header = f"# Literature Digest\n\nGenerated on {now:%Y-%m-%d %H:%M UTC}\n"
+    header = (
+        f"# Literature Digest\n\n"
+        f"Generated on {now:%Y-%m-%d %H:%M UTC}\n"
+    )
     intro = textwrap.dedent(f"""
     Time window: last {LOOKBACK_DAYS} days
     Feeds: {', '.join(f['name'] for f in FEEDS)}
 
-    Ranked by semantic similarity to your canonical papers and filtered by keywords.
+    Ranked by the active profile's relevance rubric, with semantic similarity used
+    for shortlisting and tie-breaking.
     """)
 
     body_parts = []
@@ -1225,7 +1367,11 @@ def save_markdown(md: str) -> str:
     print(f"Saved digest to {path}")
     return path
 
-def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper], history_papers: List[Paper]) -> str:
+def build_html_digest(
+    new_papers: List[Paper],
+    prev_papers: List[Paper],
+    history_papers: List[Paper],
+) -> str:
     """Return a full HTML document string with two sections:
     - Today's Feed: new since last digest
     - Previous Feed: already seen in last digest
@@ -1233,9 +1379,6 @@ def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper], history
     Also embeds a machine-readable JSON blob of paper keys as an HTML comment
     so future runs can detect duplicates.
     """
-    import json
-    from html import escape
-
     now = datetime.now(timezone.utc)
 
     # standalone inline CSS
@@ -1327,7 +1470,8 @@ def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper], history
             date_str = p.published.astimezone(timezone.utc).strftime("%Y-%m-%d")
             score_str = f"{p.score:.3f}" if not math.isnan(p.score) else "n/a"
             summary = p.summary or "No abstract/summary available."
-            summary = textwrap.shorten(summary, width=1200, placeholder="…")
+            interest = p.semantic_group or "unassigned"
+            priority = ""
 
             blocks.append(f"""
             <div class="paper">
@@ -1338,7 +1482,8 @@ def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper], history
               <div class="info">
                 Source: <strong>{escape(p.source)}</strong> ·
                 Date: {escape(date_str)} ·
-                Relevance score: {escape(score_str)}
+                Semantic score: {escape(score_str)} ·
+                Interest: {escape(interest)}{escape(priority)}
               </div>
               <div class="summary">{escape(summary)}</div>
             </div>
@@ -1370,6 +1515,7 @@ def build_html_digest(new_papers: List[Paper], prev_papers: List[Paper], history
             "source": p.source,
             "score": p.score,
             "authors": p.authors,
+            "semantic_group": p.semantic_group,
         }
 
     payload = {"papers": [_paper_to_dict(p) for p in history_papers]}
@@ -1474,6 +1620,8 @@ def build_email_digest(new_papers: List[Paper], prev_papers: List[Paper]) -> str
             width=EMAIL_ABSTRACT_CHARS,
             placeholder="…",
         )
+        interest = p.semantic_group or "unassigned"
+        priority = ""
         who = format_authors(p.authors)
         author_row = (
             f'<div style="margin:0 0 3px;font-family:{FONT};font-size:12px;'
@@ -1492,7 +1640,8 @@ def build_email_digest(new_papers: List[Paper], prev_papers: List[Paper]) -> str
             f"{author_row}"
             f'<div style="margin:0 0 8px;font-family:{FONT};font-size:11px;'
             f'color:{MUTED};">{escape(p.source)} &middot; {escape(date_str)}'
-            f" &middot; score {escape(score_str)}</div>"
+            f" &middot; semantic score {escape(score_str)} &middot; {escape(interest)}"
+            f"{priority}</div>"
             f'<div style="font-family:{FONT};font-size:13px;line-height:1.5;'
             f'color:{INK};">{escape(abstract)}</div>'
             f"</td></tr></table>"
@@ -1580,7 +1729,7 @@ def build_email_digest(new_papers: List[Paper], prev_papers: List[Paper]) -> str
   {prev_block}
   <div style="font-family:{FONT};font-size:11px;color:{MUTED};padding:18px 0 0;
               border-top:1px solid {LINE};margin-top:8px;">
-    Ranked by semantic similarity to your canonical seed papers. Abstracts are
+    Ranked by similarity to the closest seed group of canonical papers. Abstracts are
     truncated to {EMAIL_ABSTRACT_CHARS} characters &mdash; open a title for the full text.
   </div>
 </td></tr>
@@ -1637,7 +1786,25 @@ def post_to_slack(papers: List[Paper]) -> None:
 # ========= MAIN ===========
 # ==========================
 
-def main():
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--profile",
+        choices=sorted(PROFILES),
+        default=os.getenv("LIT_FEED_PROFILE", DEFAULT_PROFILE_NAME),
+        help="Audience profile; non-default profiles use separate digest histories.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_args(argv)
+    profile = activate_profile(args.profile)
+    print(
+        f"Active profile: {profile['display_name']} ({args.profile}); "
+        f"output: {OUTPUT_DIR}"
+    )
+
     fetched: List[Paper] = []
     for feed in FEEDS:
         try:
@@ -1668,14 +1835,19 @@ def main():
     # Use the most recent NON-today digest as the accumulated history baseline
     prev_path = most_recent_non_today_digest_path(OUTPUT_DIR)
     prev_papers = load_papers_from_html(prev_path) if prev_path else []
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     prev_papers = [p for p in prev_papers if p.published >= cutoff]
+
     seen_keys = {paper_key(p) for p in prev_papers}
 
     yesterday_date = today_date - timedelta(days=1)
 
     # Merge today's fetched papers with accumulated previous papers, then dedup by key
     merged = {}
+    # Cached judgments come last so their versioned LLM metadata survives a fresh
+    # copy of the same feed entry. Only prev_papers contributes to seen_keys, so a
+    # formerly rejected paper can still appear as new after a rubric revision.
     for p in (fetched + prev_papers):
         merged[paper_key(p)] = p
     merged_papers = list(merged.values())
@@ -1683,42 +1855,49 @@ def main():
     # Rank first, so admission can use the score.
     ranked = rank_papers(merged_papers)
 
-    # ---- Admission -----------------------------------------------------------
-    # Hard floor first, then two routes in: the paper used your vocabulary, or the
-    # ranker put it close enough to a seed group. The floor applies to history too,
-    # so nothing below it can appear in either section or enter today's history.
-    admitted, by_keyword, by_score = [], 0, 0
-    history_kept, below_floor = 0, 0
+    # ---- Admission and profile judgment -------------------------------------
+    # Stage 1 is deliberately high recall: hard semantic floor, biological-domain
+    # gate, then either keyword or semantic admission. Stage 2 applies the profile's
+    # compound scientific intent to this much smaller set with one batched LLM call.
+    prefiltered, by_keyword, by_score = [], 0, 0
+    history_candidates, below_floor, outside_domain = 0, 0, 0
     for p in ranked:
         if math.isnan(p.score) or p.score < TODAY_MIN_SCORE:
             below_floor += 1
             continue
-        if paper_key(p) in seen_keys:
-            admitted.append(p)
-            history_kept += 1
+        if not matches_domain_keywords(p):
+            outside_domain += 1
             continue
+        seen = paper_key(p) in seen_keys
         kw = matches_include_keywords(p)
         sem = (SEMANTIC_ADMIT_SCORE > 0
                and not math.isnan(p.score)
                and p.score >= SEMANTIC_ADMIT_SCORE)
-        if kw or sem:
-            admitted.append(p)
-            by_keyword += bool(kw)
-            by_score += bool(sem and not kw)
+        if seen or kw or sem:
+            prefiltered.append(p)
+            history_candidates += bool(seen)
+            by_keyword += bool(kw and not seen)
+            by_score += bool(sem and not kw and not seen)
 
-    failed_admission = len(ranked) - len(admitted) - below_floor
-    print(f"Admitted {len(admitted)} of {len(ranked)} ranked: "
-          f"{history_kept} already in history, {by_keyword} new on keywords, "
-          f"{by_score} new on similarity (>= {SEMANTIC_ADMIT_SCORE}); "
-          f"rejected {below_floor} below the hard floor (< {TODAY_MIN_SCORE}) "
-          f"and {failed_admission} by admission criteria.")
+    failed_admission = (
+        len(ranked) - len(prefiltered) - below_floor - outside_domain
+    )
+    admitted = prefiltered
 
-    # Everything downstream -- the two feeds and the remembered history -- works
-    # from the admitted set only. Papers we fetched but did not admit must NOT be
-    # recorded, or a later seed change could never surface them.
-    all_papers = [p for p in admitted if paper_key(p) not in seen_keys]
-    ranked = admitted
+    print(
+        f"Prefiltered {len(prefiltered)} of {len(ranked)} ranked: "
+        f"{history_candidates} from history, {by_keyword} new on keywords, "
+        f"{by_score} new on similarity (>= {SEMANTIC_ADMIT_SCORE}); rejected "
+        f"{below_floor} below the hard floor (< {TODAY_MIN_SCORE}), "
+        f"{outside_domain} outside the biological domain, and "
+        f"{failed_admission} by admission criteria."
+    )
 
+    # Everything rendered and marked "seen" uses only the accepted set. Rejected
+    # decisions are cached separately so they avoid repeat API cost while remaining
+    # eligible to surface as new after a rubric-version change.
+    ranked = sort_for_profile(admitted)
+    
     # Split AFTER ranking, but keep accumulated previous even if not in today's RSS
     new_items, prev_items = [], []
     has_history = bool(prev_papers)  # i.e., we found a prior digest

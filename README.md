@@ -1,63 +1,86 @@
 # Lit Feed Digest
 
-This repo collects two helpers for generating and distributing a literature digest:
+A weekly literature digest, mailed by cron. Fork of [`zyj1729/lit_feed`](https://github.com/zyj1729/lit_feed)
+with local feeds, keywords, seed papers, and mail delivery.
 
-1. `lit_feed.py`: fetches RSS feeds (arXiv, bioRxiv, journals), filters them by keyword, ranks them by semantic similarity to canonical papers, and writes a markdown + HTML digest. It can also post top hits to Slack if you configure an incoming webhook.
-2. `send_digest_html.py`: reads an existing HTML digest file and sends it via email using SMTP settings provided through environment variables.
+| File | Role |
+|---|---|
+| `lit_feed.py` | Fetches RSS/Crossref feeds, filters, ranks by similarity to seed papers, writes `digests/digest_YYYY-MM-DD.html` (archive, carries the seen-paper history) and `digest_YYYY-MM-DD.email.html` (the copy that gets mailed). |
+| `send_digest_html.py` | Mails an HTML digest over SMTP. |
+| `run_lit_feed_job.sh` | What cron runs: builds the digest, then mails it. |
+| `dev_run.sh` | Builds a digest from the working tree into `digests_dev/`, with no email. Use this to test changes. |
 
 ## Requirements
 
-- Python 3.11+ (any modern 3.x interpreter should work)
-- Install dependencies with `pip install -r requirements.txt` (create this file as needed) or manually:
-
-  ```bash
-  pip install feedparser requests numpy sentence-transformers
-  ```
-
-## Installation (from original `zyj1729/lit_feed`)
+Python 3.11+, in the `lit_feed` conda env:
 
 ```bash
-git clone https://github.com/zyj1729/lit_feed.git
-pip install feedparser requests sentence-transformers torch
+pip install feedparser requests numpy sentence-transformers torch
 ```
 
-This repository builds on the original `zyj1729/lit_feed` effort for the digest generation.
+## Credentials
 
-## Generating the Digest (`lit_feed.py`)
+The Gmail App Password lives in `.env`, which `.gitignore` excludes so it never
+reaches the public remote. `run_lit_feed_job.sh` sources it; `lit_feed.py` also
+reads it directly.
 
-1. Set configuration at the top of the file if you want to tweak feeds, keywords, or output directories.
-2. Optional environment variables:
-   - `LIT_DIGEST_SLACK_WEBHOOK`: Slack incoming webhook URL used by `post_to_slack()` (leave empty to skip Slack).
-3. Run the script to produce an HTML digest in `./digests/`:
-   ```bash
-   python lit_feed.py
-   ```
-   Output files are named `digest_YYYY-MM-DD.html` (and `*.md` when markdown is saved).
-
-## Sending the Digest via Email (`send_digest_html.py`)
-
-This script expects a digest HTML file path as an argument and reads SMTP settings from environment variables:
-
-| Env Var | Description |
-|---------|-------------|
-| `LIT_SMTP_HOST` | SMTP server host (required) |
-| `LIT_SMTP_PORT` | SMTP port (default: `587`) |
-| `LIT_SMTP_USER` | Username (optional; required if SMTP auth needed) |
-| `LIT_SMTP_PASS` | Password or app token (optional but needed with auth) |
-| `LIT_FROM` | From address (required) |
-| `LIT_TO` | Comma-separated recipients (required) |
-| `LIT_SMTP_STARTTLS` | `1` (default) to use STARTTLS, `0` to disable |
-| `LIT_SUBJECT` | Override email subject |
-
-Example:
 ```bash
-export LIT_SMTP_HOST="smtp.example.com"
-export LIT_SMTP_PORT=587
-export LIT_SMTP_USER="user@example.com"
-export LIT_SMTP_PASS="app-token"
-export LIT_FROM="Lit Feed <lit@example.com>"
-export LIT_TO="you@example.com, teammate@example.com"
-
-python send_digest_html.py digests/digest_2025-12-18.html
+cp .env.example .env && chmod 600 .env
+# then put the 16-character App Password in LIT_SMTP_PASS
 ```
 
+Get one at <https://myaccount.google.com/apppasswords> (the option only appears
+once 2-Step Verification is on). **Google revokes these periodically** — when
+`cron.log` shows `535 ... BadCredentials`, the digest is still building fine and
+only the send step is broken. Generate a new password, put it in `.env`, done.
+
+Non-secret mail settings (`LIT_SMTP_HOST`, `LIT_SMTP_USER`, `LIT_FROM`, `LIT_TO`,
+`LIT_SUBJECT`, `LIT_SMTP_STARTTLS`) stay in `run_lit_feed_job.sh`.
+
+## Testing a change
+
+Never run `lit_feed.py` directly to test: it writes into `digests/`, which marks
+papers as seen and silently empties the next real digest's "Today's Feed".
+
+```bash
+./dev_run.sh          # -> digests_dev/, no email
+```
+
+To test mail delivery without spamming the recipient list, override `LIT_TO` with
+your own address for the one run.
+
+## How a paper gets in
+
+Four stages, in order:
+
+1. **Exclusions** — `EXCLUDE_KEYWORDS`, applied at fetch time.
+2. **Hard floor** — similarity to the closest seed group must reach `TODAY_MIN_SCORE`.
+3. **Domain gate** — the title or abstract must contain a `DOMAIN_KEYWORDS` term.
+   This is what rejects ordinary machine-learning papers (EHR transformers, remote
+   sensing, battery models) that match a keyword like "foundation model" by coincidence.
+4. **Admission** — an `INCLUDE_KEYWORDS` match, *or* a score of at least
+   `SEMANTIC_ADMIT_SCORE` for work that is on topic but does not use our vocabulary.
+
+## Local divergence from upstream
+
+Upstream tunes for a mostly-cardiovascular, model-development audience. This fork
+also follows organ and lineage development, so four settings differ. Each was
+measured against a real digest (`digests/digest_2026-08-25.html`, 465 papers)
+rather than guessed:
+
+- **Extra feeds** — five more bioRxiv subject feeds (cancer, cell, developmental
+  biology, genetics, genomics).
+- **`INCLUDE_KEYWORDS`** — organ and lineage terms, plus a
+  `lung, limb & hematopoietic development` seed group.
+- **`DOMAIN_KEYWORDS`** — extended to match. This gate only ever *removes* papers,
+  so any include keyword missing from it is silently cancelled. Upstream's list is
+  phrased around assay names and dropped genuine work that names the biology
+  instead (enhancer–promoter hubs, cortical organoids, a "cellular atlas" that
+  never says "cell atlas"). With our additions the gate still drops 38% of the
+  pool — the generic-ML noise it exists for.
+- **`TODAY_MIN_SCORE = 0.30`** — upstream ships 0.465, which cuts 65% of what this
+  feed carries. The upgrade to `max_seq_length=512` moved scores by a median of
+  only −0.005, so 0.30 still means what it meant before.
+
+`EMAIL_ABSTRACT_CHARS` is also restored: upstream now mails full abstracts, which
+put the message at 130KB, past Gmail's ~102KB clipping limit. Truncated, it is 82KB.
