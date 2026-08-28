@@ -6,3 +6,12 @@ __pycache__/
 *.log
 digests/
 
+# Output of dev_run.sh. Kept out of digests/ so a test run can never mark papers
+# as seen and empty the next real digest's "Today's Feed".
+digests_dev/
+
+# Local secrets: the Gmail App Password lives here and must never be committed.
+.env
+
+# Pre-refactor snapshots
+*.bak-*
