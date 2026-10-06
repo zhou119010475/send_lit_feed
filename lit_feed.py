@@ -473,10 +473,6 @@ INCLUDE_KEYWORDS = [
     "virtual cell",
     "virtual-cell",
 
-    # cardiovascular
-    "cardiomyopathy",
-    "cardiomyopathies",   # "cardiomyopathy" does not substring-match this
-
     # organ / lineage development (local additions)
     "lung",
     "kidney",
@@ -548,7 +544,6 @@ TAGS = [
     ("gene regulation",  "#56B4E9", ["gene regulatory"]),
     ("foundation model", "#3B3B3B", ["foundation model", "transformer"]),
     ("virtual cell",     "#6F4C9B", ["virtual cell", "virtual-cell"]),
-    ("cardiac",          "#A0132B", ["cardiomyopathy"]),
 ]
 
 # ---- Canonical papers ----
@@ -574,43 +569,6 @@ TAGS = [
 # without generic machine-learning papers coming along with it.
 
 CANONICAL_PAPERS = [
-    # ---- cardiovascular single-cell --------------------------------
-    {
-        "group": "cardiovascular single-cell",
-        "title": "Cells of the adult human heart",
-        "summary": "Large-scale single-cell and single-nucleus transcriptomes of six "
-                   "anatomical adult human heart regions define a human cardiac cell atlas. "
-                   "The data reveal heterogeneity of cardiomyocytes, pericytes and "
-                   "fibroblasts, distinct atrial and ventricular cell subsets, the "
-                   "complexity of the cardiac vasculature along the arterio-venous axis, and "
-                   "cardiac-resident macrophages with inflammatory and protective "
-                   "signatures.",
-        # 10.1038/s41586-020-2797-4
-    },
-    {
-        "group": "cardiovascular single-cell",
-        "title": "Single-nucleus profiling of human dilated and hypertrophic cardiomyopathy",
-        "summary": "Single-nucleus RNA sequencing of nearly 600,000 nuclei from left "
-                   "ventricle samples of 11 dilated cardiomyopathy, 15 hypertrophic "
-                   "cardiomyopathy and 16 non-failing hearts maps molecular alterations at "
-                   "single-cell resolution. Dilated and hypertrophic cardiomyopathy profiles "
-                   "converge at tissue and cell-type level, and a subset of cardiomyopathy "
-                   "hearts harbours a unique activated fibroblast population probed by "
-                   "CRISPR knockout screening.",
-        # 10.1038/s41586-022-04817-8
-    },
-    {
-        "group": "cardiovascular single-cell",
-        "title": "An integrative single-nucleus multiomic atlas of the human left ventricle identifies gene regulatory network dynamics across cardiac development, aging, and disease",
-        "summary": "An integrated multiomic atlas of human cardiac cells combining "
-                   "single-nucleus RNA-seq from 299 donors and single-nucleus ATAC-seq from "
-                   "106 donors. Developmental and disease-driven remodelling converge at "
-                   "transcriptomic and epigenomic levels, revealing reactivation of fetal "
-                   "gene programs and cell-type-specific transcription factors. A "
-                   "cell-type-resolved enhancer-to-gene linkage map refines dilated and "
-                   "hypertrophic cardiomyopathy risk loci.",
-        # 10.1186/s13059-026-04061-7
-    },
     # ---- single-cell foundation models -----------------------------
     {
         "group": "single-cell foundation models",
@@ -1016,7 +974,6 @@ DOMAIN_KEYWORDS = [
     "multi-omic", "multi omic", "multiomic", "multiome", "cite-seq",
     "chromatin accessibility", "open chromatin", "gene regulatory",
     "gene expression", "transcriptomic", "cell atlas", "cell state",
-    "cardiomyopathy", "heart failure", "cardiac",
     "virtual cell", "virtual-cell",
 
     # LOCAL: this gate only ever REMOVES papers, so every biological term we admit
@@ -1059,8 +1016,8 @@ PROFILES = {
             "Deep-learning model development, evaluation, and representation learning for "
             "single-cell or multi-omics data, perturbation prediction, and virtual-cell "
             "modeling are the primary interests. Biological or mechanistic studies that "
-            "mainly use an omics assay are background priority; cardiovascular disease is "
-            "the favored application area. LOCAL: single-cell and multi-omic studies of "
+            "mainly use an omics assay are background priority. LOCAL: single-cell and "
+            "multi-omic studies of "
             "organ and lineage development -- lung, kidney, limb and hematopoiesis, "
             "including developmental cell atlases -- are a first-class interest here, not "
             "background. send_lit_feed-2 adds the erythroid-atlas project: primitive "

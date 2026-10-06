@@ -150,8 +150,13 @@ Everything below is in `lit_feed.py`, marked `LOCAL (send_lit_feed-2)`.
     took that query from 262 results to 122.
 - **De-duplication by title** — PubMed and an RSS feed reach the same paper through
   different links, which the link-based key sees as two papers.
+- **Cardiovascular removed** — upstream's `cardiovascular single-cell` seed group,
+  the `cardiomyopathy` include keywords, the `cardiac` tag and the cardiac
+  `DOMAIN_KEYWORDS` terms are all gone. A heart paper can still enter on a general
+  term such as "single-cell", but nothing ranks it up any more.
 
-Measured on 2026-10-06 against the history copied from `send_lit_feed-1`: 3460
+Measured on 2026-10-06, before the cardiovascular removal (which took no slot in
+that run), against the history copied from `send_lit_feed-1`: 3460
 papers fetched, 272 newly admitted, and of the 40 shown in Today's Feed, 23 came
 from the three project seed groups and 17 from the original ones. The mailed copy
 was 86KB, under Gmail's ~102KB clip.
