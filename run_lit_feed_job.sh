@@ -6,7 +6,10 @@ DEFAULT_CONDA_BASE="$HOME/miniconda3"
 DETECTED_CONDA_BASE="$(command -v conda >/dev/null 2>&1 && conda info --base 2>/dev/null || true)"
 CONDA_BASE="${CONDA_BASE:-${DETECTED_CONDA_BASE:-$DEFAULT_CONDA_BASE}}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-lit_feed}"
-REPO_ROOT="${REPO_ROOT:-/mnt/dev0/zhouw/send_lit_feed-1}"
+# Derived from this script's own location, not hardcoded: this directory began as a
+# copy of send_lit_feed-1, and a literal path here would have had cron run that
+# repository's code and mail that repository's digest.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 DATA_ROOT="${DATA_ROOT:-/mnt/dev0/zhouw}"
 
 # Keep temp files and model caches on the large data disk, not the small system
@@ -36,12 +39,17 @@ export LIT_SMTP_HOST="smtp.gmail.com"
 export LIT_SMTP_PORT="587"
 export LIT_SMTP_USER="wenjiangz1123@gmail.com"
 export LIT_FROM="<wenjiangz1123@gmail.com>"
-export LIT_TO="wenjiang.zhou@ucsf.edu, peng.he@ucsf.edu, yuefei.zhu@ucsf.edu, Konstantinos.Stasinos@ucsf.edu, yujie.zhang@ucsf.edu"
+# This is the personal, project-specific feed (erythroid atlas / transgene mapping),
+# so it goes to one inbox. The group list stays with send_lit_feed-1. Add addresses
+# here, comma-separated, to share it.
+export LIT_TO="${LIT_TO:-wenjiang.zhou@ucsf.edu}"
 export LIT_SMTP_STARTTLS="1"
-export LIT_SUBJECT="[LITFeed] Recent Literature"
+# Distinct from send_lit_feed-1's "[LITFeed]" so the two can be filtered apart.
+export LIT_SUBJECT="[LITFeed-Blood] Recent Literature"
 
 # Identifies us to Crossref (used for the preprints.org feed) so it places us in
-# its faster, "polite" rate-limit pool instead of the anonymous one.
+# its faster, "polite" rate-limit pool instead of the anonymous one. The PubMed
+# feeds send the same address to NCBI, which asks for one.
 export LIT_CROSSREF_EMAIL="wenjiangz1123@gmail.com"
 
 # Fail here rather than after a full 10-minute digest build. Gmail also revokes App

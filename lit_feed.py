@@ -2,7 +2,7 @@
 """
 Recent literature digest for arXiv / bioRxiv / journals.
 
-- Fetches RSS feeds (and Crossref, for servers that block scripted clients)
+- Fetches RSS feeds (and Crossref or PubMed, for servers that block scripted clients)
 - Applies profile-specific domain and keyword filters
 - Shortlists by seed-paper similarity and optionally judges with an LLM
 - Writes Markdown digest
@@ -19,6 +19,7 @@ import os
 import re
 import textwrap
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -73,6 +74,18 @@ CROSSREF_CONTACT = os.getenv("LIT_CROSSREF_EMAIL", "")
 CROSSREF_ROWS = 500
 CROSSREF_PAUSE_SEC = 1.0
 CROSSREF_RETRIES = 4
+
+# LOCAL: PubMed E-utilities, for journals whose RSS is closed to scripts (every
+# ashpublications.org endpoint -- Blood, Blood Advances -- answers 403/404) and for
+# topic searches that should reach a paper whatever journal it lands in. NCBI asks
+# clients to identify themselves and allows 3 requests/second without an API key,
+# 10 with one (NCBI_API_KEY in .env, optional).
+PUBMED_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+PUBMED_CONTACT = os.getenv("LIT_PUBMED_EMAIL", CROSSREF_CONTACT)
+PUBMED_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
+PUBMED_BATCH = 200
+PUBMED_PAUSE_SEC = 0.4
+PUBMED_RETRIES = 4
 
 # A new paper enters the high-recall shortlist if it matches an include keyword or
 # reaches this seed-similarity score. A separate 0.40 hard floor applies first. The
@@ -253,6 +266,79 @@ FEEDS = [
         "prefix": "10.20944",
         "max_items": 3000,
     },
+
+    # LOCAL: PubMed feeds (see fetch_pubmed). "term" is any PubMed query; the
+    # lookback window is added for you. Each paper is labelled with its own journal,
+    # not with the feed name, so a topic search reads the same as a journal feed.
+    # These come last on purpose: when PubMed and an RSS feed above carry the same
+    # paper, the title de-duplication in main() keeps the first copy fetched.
+    {
+        # Blood and Blood Advances were dropped in 4783e61 because their RSS never
+        # yielded an item. PubMed carries both, ahead-of-print included.
+        "name": "PubMed: hematology journals",
+        "type": "pubmed",
+        "term": '"Blood"[jour] OR "Blood Adv"[jour] OR "Haematologica"[jour] '
+                'OR "Hemasphere"[jour] OR "Exp Hematol"[jour]',
+        "max_items": 400,
+    },
+    {
+        "name": "PubMed: stem cell & development journals",
+        "type": "pubmed",
+        "term": '"Cell Stem Cell"[jour] OR "Stem Cell Reports"[jour] OR "Dev Cell"[jour] '
+                'OR "Nat Cell Biol"[jour] OR "Development"[jour]',
+        "max_items": 400,
+    },
+    {
+        "name": "PubMed: genomics journals",
+        "type": "pubmed",
+        "term": '"Genome Biol"[jour] OR "Nucleic Acids Res"[jour]',
+        "max_items": 400,
+    },
+    {
+        "name": "PubMed: erythropoiesis",
+        "type": "pubmed",
+        "term": '(erythropoiesis[tiab] OR erythroid[tiab] OR erythroblast*[tiab] '
+                'OR "fetal hemoglobin"[tiab] OR "fetal haemoglobin"[tiab] '
+                'OR "hemoglobin switching"[tiab] OR "globin switching"[tiab] '
+                'OR "globin gene"[tiab] OR "globin genes"[tiab]) '
+                # NRF2 spells out as "nuclear factor erythroid 2-related factor 2".
+                'NOT (NRF2[tiab] OR NFE2L2[tiab] OR "erythroid 2"[tiab])',
+        "max_items": 600,
+    },
+    {
+        # Hematopoiesis alone is mostly clinical transplant and leukemia work, so
+        # this one is narrowed to development and regulation.
+        "name": "PubMed: developmental hematopoiesis",
+        "type": "pubmed",
+        "term": '(hematopoiesis[tiab] OR haematopoiesis[tiab] '
+                'OR "hematopoietic stem"[tiab] OR "haematopoietic stem"[tiab] '
+                'OR "hematopoietic progenitor"[tiab] OR "hematopoietic progenitors"[tiab]) '
+                'AND ("single-cell"[tiab] OR "single cell"[tiab] OR fetal[tiab] '
+                'OR embryonic[tiab] OR "yolk sac"[tiab] OR "fetal liver"[tiab] '
+                'OR "gene regulatory"[tiab] OR chromatin[tiab] '
+                'OR "transcription factor"[tiab] OR "transcription factors"[tiab])',
+        "max_items": 400,
+    },
+    {
+        # Two halves: locating a transgene / vector in the genome, and detecting or
+        # quantifying one in sequencing reads.
+        "name": "PubMed: transgene mapping",
+        "type": "pubmed",
+        "term": '"transgene integration"[tiab] OR "transgene insertion"[tiab] '
+                'OR "transgene mapping"[tiab] OR "transgene copy number"[tiab] '
+                'OR "targeted locus amplification"[tiab] '
+                # Vectors only. Bare retrovir*/provir*/transpos* here pulled in HIV and
+                # HTLV integration virology and bacterial insertion sequences.
+                'OR ((transgene*[tiab] OR lentivir*[tiab] OR "retroviral vector"[tiab] '
+                'OR "retroviral vectors"[tiab] OR "viral vector"[tiab] '
+                'OR "viral vectors"[tiab] OR AAV[tiab] OR "CAR T"[tiab] OR "CAR-T"[tiab]) '
+                'AND ("integration site"[tiab] OR "integration sites"[tiab] '
+                'OR "insertion site"[tiab] OR "insertion sites"[tiab])) '
+                'OR (transgene*[tiab] AND ("RNA-seq"[tiab] OR "single-cell"[tiab] '
+                'OR "single cell"[tiab] OR "long-read"[tiab] OR nanopore[tiab] '
+                'OR "whole-genome sequencing"[tiab]))',
+        "max_items": 300,
+    },
 ]
 
 # ---- Keyword filters ----
@@ -269,6 +355,76 @@ FEEDS = [
 # nothing today, because a paper using one term nearly always uses another that already
 # matches; they are here as insurance against the day it does not. Counts in comments
 # are papers each term newly admitted that no other keyword caught.
+
+# LOCAL (send_lit_feed-2): the erythroid-atlas project. These two lists are spliced
+# into BOTH INCLUDE_KEYWORDS and DOMAIN_KEYWORDS below. The domain gate only ever
+# removes papers, so a term that admits but is missing from the gate does nothing;
+# sharing one list makes that mistake impossible.
+#
+# Deliberately absent: bare "blood" and bare "hemoglobin". The first matches blood
+# pressure, blood glucose and every clinical cohort; the second matches HbA1c and
+# "hemoglobin level" as a trial endpoint. The journal Blood is covered as a FEED
+# instead, and its papers still have to earn a place on these terms or on similarity.
+BLOOD_KEYWORDS = [
+    # erythroid lineage. Spelled out rather than a bare "erythro", which would also
+    # match erythromycin and erythroderma.
+    "erythroid",
+    "erythropoie",        # erythropoiesis, erythropoietic, erythropoietin
+    "erythroblast",
+    "erythrocyte",
+    "red blood cell",
+    " red cell",          # leading space: "cultured cells" and "engineered cells" contain "red cell"
+    "reticulocyte",
+    "enucleation",
+    # globin regulation / hemoglobin switching
+    "fetal hemoglobin",
+    "fetal haemoglobin",
+    "hemoglobin switch",
+    "haemoglobin switch",
+    "globin gene",
+    "globin switch",
+    "globin locus",
+    "beta-globin", "β-globin",
+    "gamma-globin", "γ-globin",
+    "embryonic globin",
+    # hematopoiesis, both spellings ("hematopoietic"/"hematopoiesis" above are US only)
+    "hematopoie",
+    "haematopoie",
+    "hemogenic",
+    "haemogenic",
+    "HSPC",
+    "megakaryo",
+    "yolk sac",
+    "fetal liver",
+    "bone marrow",
+    # the erythroid transcription-factor core, and the two being overexpressed
+    "GATA1", "GATA2", "GATA5", "LMO2", "TAL1", "KLF1", "BCL11A",
+]
+
+TRANSGENE_KEYWORDS = [
+    "transgene",          # transgenes, transgene mapping / integration / insertion
+    "integration site",   # substring also covers "integration sites"
+    "integration-site",
+    "insertion site",
+    "insertion-site",
+    "vector integration",
+    "targeted locus amplification",
+    "vector copy number",
+    "lentiviral vector",
+    "insertional mutagenesis",
+]
+
+# Phrases that contain one of our keywords but mean something else. They are blanked
+# out of the text before any include / domain / tag match, which is gentler than an
+# EXCLUDE_KEYWORDS veto: the paper is not rejected, it just cannot get in on this
+# phrase alone. Today that is NRF2, whose full name -- "nuclear factor erythroid
+# 2-related factor 2", or "(erythroid-derived 2)-like 2" -- puts "erythroid" into
+# every oxidative-stress paper; they were 15 of the 21 lowest-scoring matches in the
+# first PubMed pool.
+KEYWORD_FALSE_FRIENDS = re.compile(
+    r"erythroid[\s\-\u2010-\u2015]*(?:derived[\s\-\u2010-\u2015]*)?2", re.IGNORECASE
+)
+
 INCLUDE_KEYWORDS = [
     # single-cell, and the single-nucleus assays the cardiac literature actually uses
     "single-cell",
@@ -336,6 +492,10 @@ INCLUDE_KEYWORDS = [
     "genomics",
     "developmental biology",
     "atlas",
+
+    # erythroid-atlas project (send_lit_feed-2 additions)
+    *BLOOD_KEYWORDS,
+    *TRANSGENE_KEYWORDS,
 ]
 
 # If any of these appear, drop the item.
@@ -347,7 +507,10 @@ EXCLUDE_KEYWORDS = [
     "bacterial community",
     "ecology",
     "behavioral",
-    "mouse model"  # remove if you do want mice
+    # LOCAL (send_lit_feed-2): upstream's "mouse model" veto is dropped here.
+    # "In a mouse model of beta-thalassemia" is routine wording in hematology, and
+    # PubMed's full abstracts trip it far more often than an RSS teaser did. Measured
+    # on a 3530-paper pool it cost 8 otherwise-admitted papers a month.
 ]
 
 # ---- Topic tags ----
@@ -364,6 +527,18 @@ EXCLUDE_KEYWORDS = [
 TAG_MAX = 3  # chips per paper, so a card cannot sprout a wall of labels
 
 TAGS = [
+    # LOCAL (send_lit_feed-2): project chips first, so TAG_MAX never crowds them out.
+    # Yellow is the one stock Okabe-Ito colour the list had not used; teal and brown
+    # are outside the palette but clear AA with white text (5.1:1 and 6.8:1).
+    ("erythroid",        "#F0E442", ["erythroid", "erythropoie", "erythroblast", "erythrocyte",
+                                     "red blood cell", " red cell", "reticulocyte",
+                                     "fetal hemoglobin", "fetal haemoglobin",
+                                     "globin gene", "globin switch", "globin locus",
+                                     "beta-globin", "β-globin", "gamma-globin", "γ-globin"]),
+    ("hematopoiesis",    "#00798C", ["hematopoie", "haematopoie", "hemogenic", "haemogenic",
+                                     "HSPC", "megakaryo", "yolk sac", "fetal liver",
+                                     "bone marrow"]),
+    ("transgene",        "#7A5230", TRANSGENE_KEYWORDS),
     ("single-cell",      "#0072B2", ["single-cell", "single cell", "scRNA-seq", "scrna"]),
     ("perturbation",     "#C05500", ["perturbation"]),
     ("multi-omics",      "#008561", ["multi-omic", "multi omic", "multiomics",
@@ -636,6 +811,193 @@ CANONICAL_PAPERS = [
         "summary": "Temporal single-cell mapping of immune cells in the lung, using "
                    "scBCR/abTCR/gdTCR-seq and lymphoid lineage inference.",
     },
+    # ---- LOCAL (send_lit_feed-2): the erythroid-atlas project ---------------
+    # Three groups rather than one, because a group is averaged into a single
+    # direction: erythroid regulation, developmental blood atlases and transgene
+    # mapping share little vocabulary, and one centroid for all three would sit
+    # close to none of them. Summaries are condensed from the published abstracts.
+    # ---- erythropoiesis & globin regulation --------------------------------
+    {
+        "group": "erythropoiesis & globin regulation",
+        "title": "Transcriptional States and Chromatin Accessibility Underlying Human Erythropoiesis",
+        "summary": "Deep transcriptomic and accessible chromatin profiling of a faithful "
+                   "ex vivo human erythroid differentiation system from hematopoietic stem "
+                   "and progenitor cells reveals stage-specific transcriptional states and "
+                   "chromatin accessibility during erythropoiesis, with differentiation "
+                   "stage-predominant roles for master regulators including GATA1 and "
+                   "KLF1. Chromatin profiles are integrated with common and rare genetic "
+                   "variants associated with erythroid cell traits and diseases.",
+        # 10.1016/j.celrep.2019.05.046
+    },
+    {
+        "group": "erythropoiesis & globin regulation",
+        "title": "Population snapshots predict early haematopoietic and erythroid hierarchies",
+        "summary": "The formation of red blood cells begins with the differentiation of "
+                   "multipotent haematopoietic progenitors. Single-cell transcriptomics, "
+                   "fate assays and a theory that predicts cell fates from population "
+                   "snapshots show that haematopoietic progenitors differentiate through a "
+                   "continuous, hierarchical structure into seven blood lineages, with "
+                   "coupling between erythroid and basophil or mast cell fates and a sharp "
+                   "transcriptional switch that activates terminal erythroid "
+                   "differentiation.",
+        # 10.1038/nature25741
+    },
+    {
+        "group": "erythropoiesis & globin regulation",
+        "title": "Global transcriptome analyses of human and murine terminal erythroid differentiation",
+        "summary": "Pure populations of human and murine erythroblasts at distinct stages "
+                   "of terminal erythroid differentiation were sorted and subjected to RNA "
+                   "sequencing, creating unbiased, stage-specific transcriptomes. There "
+                   "are vast temporal changes in gene expression across differentiation "
+                   "stages and numerous differences between human and murine "
+                   "transcriptomes, providing a resource for studies of normal and "
+                   "perturbed erythropoiesis.",
+        # 10.1182/blood-2014-01-548305
+    },
+    {
+        "group": "erythropoiesis & globin regulation",
+        "title": "Development and differentiation of the erythroid lineage in mammals",
+        "summary": "The primitive erythroid lineage is the first to be specified in the "
+                   "developing embryo. Two transient waves of hematopoietic "
+                   "progenitor-derived erythropoiesis are observed before hematopoietic "
+                   "stem cells take over to produce definitive red blood cells in the "
+                   "fetal liver and later the bone marrow. Key aspects of mammalian "
+                   "erythroid development and maturation and the differences among the "
+                   "primitive and definitive erythroid cell lineages are highlighted.",
+        # 10.1016/j.dci.2015.12.012
+    },
+    {
+        "group": "erythropoiesis & globin regulation",
+        "title": "Human fetal hemoglobin expression is regulated by the developmental stage-specific repressor BCL11A",
+        "summary": "Differences in the amount of fetal hemoglobin (HbF) that persists into "
+                   "adulthood affect the severity of sickle cell disease and the "
+                   "beta-thalassemia syndromes. Expression of full-length BCL11A is "
+                   "developmentally restricted to adult erythroid cells, its "
+                   "down-regulation in primary adult erythroid cells leads to robust HbF "
+                   "expression, and BCL11A occupies discrete sites in the beta-globin gene "
+                   "cluster, consistent with a direct role in globin gene regulation.",
+        # 10.1126/science.1165409
+    },
+    {
+        "group": "erythropoiesis & globin regulation",
+        "title": "Defining the Minimal Factors Required for Erythropoiesis through Direct Lineage Conversion",
+        "summary": "Erythroid commitment and differentiation proceed through a "
+                   "lineage-restricted transcriptional network. A transcription factor "
+                   "screen shows that Gata1, Tal1, Lmo2 and c-Myc rapidly convert murine "
+                   "and human fibroblasts directly to induced erythroid progenitors, whose "
+                   "transcriptional signature resembles primitive erythroid progenitors in "
+                   "the yolk sac, whereas adding Klf1 or Myb gives a more adult-type "
+                   "globin expression pattern.",
+        # 10.1016/j.celrep.2016.05.027
+    },
+    # ---- developmental hematopoiesis --------------------------------------
+    {
+        "group": "developmental hematopoiesis",
+        "title": "Decoding human fetal liver haematopoiesis",
+        "summary": "Definitive haematopoiesis in the fetal liver supports self-renewal and "
+                   "differentiation of haematopoietic stem cells and multipotent "
+                   "progenitors. Single-cell transcriptome profiling of fetal liver, skin, "
+                   "kidney and yolk sac cells identifies the repertoire of human blood and "
+                   "immune cells during development, infers differentiation trajectories "
+                   "from HSC/MPPs, and shows a shift in fetal liver haematopoietic "
+                   "composition during gestation away from being predominantly erythroid.",
+        # 10.1038/s41586-019-1652-y
+    },
+    {
+        "group": "developmental hematopoiesis",
+        "title": "Yolk sac cell atlas reveals multiorgan functions during human early development",
+        "summary": "A comprehensive multiomic reference of the human yolk sac from 3 to 8 "
+                   "postconception weeks, integrating single-cell protein and gene "
+                   "expression data. Beyond its role as a site of hematopoiesis, the yolk "
+                   "sac has roles in metabolism, coagulation, vascular development and "
+                   "hematopoietic regulation. The emergence and decline of yolk sac "
+                   "hematopoietic stem and progenitor cells from hemogenic endothelium is "
+                   "reconstructed.",
+        # 10.1126/science.add7564
+    },
+    {
+        "group": "developmental hematopoiesis",
+        "title": "Mapping human haematopoietic stem cells from haemogenic endothelium to birth",
+        "summary": "A single-cell transcriptome map of human haematopoietic tissues from "
+                   "the first trimester to birth identifies an HSC signature that "
+                   "distinguishes haematopoietic stem cells from progenitors throughout "
+                   "gestation. Nascent HSCs populate the aorta-gonad-mesonephros region, "
+                   "placenta and yolk sac before colonizing the liver, and HSC origin is "
+                   "tracked to haemogenic endothelial cells using spatial transcriptomics.",
+        # 10.1038/s41586-022-04571-x
+    },
+    {
+        "group": "developmental hematopoiesis",
+        "title": "Blood and immune development in human fetal bone marrow and Down syndrome",
+        "summary": "Development of human fetal bone marrow, including stroma, is detailed "
+                   "using multi-omic assessment of mRNA and multiplexed protein epitope "
+                   "expression. The full blood and immune cell repertoire is established "
+                   "in a short window early in the second trimester. Haematopoietic "
+                   "progenitors from fetal liver, fetal bone marrow and cord blood differ "
+                   "transcriptionally and functionally, and B lymphocyte, erythroid and "
+                   "myeloid development is selectively disrupted in Down syndrome.",
+        # 10.1038/s41586-021-03929-x
+    },
+    # ---- transgene & vector integration mapping ---------------------------
+    {
+        "group": "transgene & vector integration mapping",
+        "title": "Large-scale discovery of mouse transgenic integration sites reveals frequent structural variation and insertional mutagenesis",
+        "summary": "Transgenesis through random integration of DNA fragments into the host "
+                   "genome can cause insertional mutagenesis and structural variation, yet "
+                   "the insertion sites of most transgenic lines are unknown. Targeted "
+                   "locus amplification identifies both the insertion site and content of "
+                   "transgenes by deep sequencing. Across 40 transgenic mouse lines, "
+                   "transgenes disrupt endogenous coding sequence in half, often with "
+                   "large deletions or structural variations at the insertion site.",
+        # 10.1101/gr.233866.117
+    },
+    {
+        "group": "transgene & vector integration mapping",
+        "title": "Efficient mapping of transgene integration sites and local structural changes in Cre transgenic mice using targeted locus amplification",
+        "summary": "For lines generated by pronuclear microinjection of a transgene "
+                   "construct, the integration site is random and in most cases not known, "
+                   "and integration can disrupt an endogenous gene. Targeted locus "
+                   "amplification efficiently maps the transgene location in Cre and "
+                   "CreERT2 transgenic lines, identifying the exact integration site and "
+                   "breakpoint sequences together with structural changes around the "
+                   "integration site.",
+        # 10.1093/nar/gkw1329
+    },
+    {
+        "group": "transgene & vector integration mapping",
+        "title": "Locating and Characterizing a Transgene Integration Site by Nanopore Sequencing",
+        "summary": "Locating sites of foreign DNA incorporation in mammalian genomes has "
+                   "proven burdensome, so the genomic location of most transgenes remains "
+                   "unknown. Nanopore sequencing identifies the site of transgene "
+                   "integration of a widely used fluorescent reporter and simultaneously "
+                   "yields an estimate of transgene copy number, direct evidence of "
+                   "transgene inversions, contaminating DNA within the transgene array, "
+                   "and definitive genotyping.",
+        # 10.1534/g3.119.300582
+    },
+    {
+        "group": "transgene & vector integration mapping",
+        "title": "INSPIIRED: A Pipeline for Quantitative Analysis of Sites of New DNA Integration in Cellular Genomes",
+        "summary": "Integration of new DNA into cellular genomes mediates replication of "
+                   "retroviruses and transposons and is used in human gene therapy. "
+                   "Tracking distributions of integration sites characterizes populations "
+                   "of transduced cells and monitors outgrowth of pathogenic clones. "
+                   "INSPIIRED is a pipeline for quantitative analysis of integration site "
+                   "distributions from paired-end sequencing, with software for alignment, "
+                   "quality control and inference of the abundance of gene-modified cells.",
+        # 10.1016/j.omtm.2016.11.002
+    },
+    {
+        "group": "transgene & vector integration mapping",
+        "title": "Joint profiling of chromatin accessibility and CAR-T integration site analysis at population and single-cell levels",
+        "summary": "In CAR-T immunotherapy the T cell genome is modified by integration of "
+                   "lentiviral vectors. EpiVIA jointly profiles chromatin accessibility "
+                   "and lentiviral integration sites at population and single-cell "
+                   "levels, validated in clonal cells with defined integration sites, "
+                   "measuring lentiviral integration sites and chromatin accessibility of "
+                   "host and viral genomes at single-cell resolution.",
+        # 10.1073/pnas.1919259117
+    },
 ]
 
 
@@ -681,11 +1043,15 @@ DOMAIN_KEYWORDS = [
     "cellular atlas", "cell fate", "cell type", "cell differentiation",
     "transcription factor", "enhancer", "promoter", "regulatory element",
     "epigenom", "lineage", "rna-seq", "atac-seq", "chip-seq",
+
+    # LOCAL (send_lit_feed-2): see BLOOD_KEYWORDS.
+    *BLOOD_KEYWORDS,
+    *TRANSGENE_KEYWORDS,
 ]
 
 PROFILES = {
     DEFAULT_PROFILE_NAME: {
-        "display_name": "Single-Cell ML",
+        "display_name": "Single-Cell ML + Erythroid / Transgene",
         "output_subdir": "",  # preserve the existing cron and digest history
         # Unused since upstream ac4de18 removed the LLM judge; kept as the written
         # statement of what this feed is for.
@@ -697,7 +1063,10 @@ PROFILES = {
             "the favored application area. LOCAL: single-cell and multi-omic studies of "
             "organ and lineage development -- lung, kidney, limb and hematopoiesis, "
             "including developmental cell atlases -- are a first-class interest here, not "
-            "background."
+            "background. send_lit_feed-2 adds the erythroid-atlas project: primitive "
+            "versus definitive erythropoiesis, globin switching, the GATA/LMO2/TAL1 "
+            "erythroid regulatory network, developmental hematopoiesis, and methods for "
+            "locating or quantifying transgenes and integrated vectors."
         ),
         "include_keywords": INCLUDE_KEYWORDS,
         "domain_keywords": DOMAIN_KEYWORDS,
@@ -779,7 +1148,7 @@ def tags_for(paper: Paper) -> List[tuple]:
     nothing, and a paper reloaded from an old digest gets today's tag vocabulary
     instead of whatever was current when it was first seen.
     """
-    text = f"{paper.title} {paper.summary}".lower()
+    text = match_text(paper)
     hits = [
         (label, colour)
         for label, colour, keywords in TAGS
@@ -876,19 +1245,29 @@ def activate_profile(name: str) -> dict:
     return profile
 
 
+def match_text(paper: Paper) -> str:
+    """Lower-cased title + abstract for keyword matching, false friends removed."""
+    return KEYWORD_FALSE_FRIENDS.sub(" ", f"{paper.title} {paper.summary}").lower()
+
+
 def is_excluded(paper: Paper) -> bool:
     """Hard veto. Applied at fetch time, before anything is embedded."""
     if not EXCLUDE_KEYWORDS:
         return False
     text = f"{paper.title} {paper.summary}".lower()
-    return any(k.lower() in text for k in EXCLUDE_KEYWORDS)
+    # LOCAL: match at the START of a word, not anywhere inside one. As a plain
+    # substring "plant" vetoed every transplant, implant and explant paper, and
+    # "ecology" every gynecology one -- invisible while the feed was single-cell
+    # methods, fatal for a hematology feed where transplantation is everywhere.
+    # Suffixes still match ("plants", "plant-derived", "behaviorally").
+    return any(re.search(r"\b" + re.escape(k.lower()), text) for k in EXCLUDE_KEYWORDS)
 
 
 def matches_include_keywords(paper: Paper) -> bool:
     """Did the paper use your vocabulary? One of two routes into the digest."""
     if not INCLUDE_KEYWORDS:
         return True  # no include list means everything is eligible
-    text = f"{paper.title} {paper.summary}".lower()
+    text = match_text(paper)
     return any(k.lower() in text for k in INCLUDE_KEYWORDS)
 
 
@@ -904,7 +1283,7 @@ def matches_domain_keywords(paper: Paper) -> bool:
     keywords = ACTIVE_PROFILE.get("domain_keywords", [])
     if not keywords:
         return True
-    text = f"{paper.title} {paper.summary}".lower()
+    text = match_text(paper)
     return any(k.lower() in text for k in keywords)
 
 
@@ -934,6 +1313,18 @@ def paper_key(p: Paper) -> str:
         return link
     date_str = p.published.astimezone(timezone.utc).strftime("%Y-%m-%d")
     return f"{p.source}|{p.title.strip().lower()}|{date_str}"
+
+def title_key(p: Paper) -> str:
+    """Identity by title, for the same paper reached through two different links.
+
+    paper_key cannot see that https://www.nature.com/articles/... from an RSS feed
+    and https://doi.org/10.1038/... from PubMed are one paper. Short titles
+    ("Correction", "Reply") are not distinctive enough to merge on, so they get no
+    key at all.
+    """
+    key = re.sub(r"[^a-z0-9]+", " ", p.title.lower()).strip()
+    return key if len(key) >= 25 else ""
+
 
 def digest_date_from_path(path: str) -> str | None:
     # expects digest_YYYY-MM-DD.html
@@ -1182,6 +1573,153 @@ def fetch_crossref(feed: Dict[str, Any]) -> List[Paper]:
     return papers
 
 
+def _pubmed_request(endpoint: str, params: Dict[str, Any]) -> Optional[requests.Response]:
+    """One E-utilities call, retrying on rate limits. None if it never succeeds."""
+    payload = {"db": "pubmed", "tool": "lit_feed", **params}
+    if PUBMED_CONTACT:
+        payload["email"] = PUBMED_CONTACT
+    if PUBMED_API_KEY:
+        payload["api_key"] = PUBMED_API_KEY
+    delay = 1.0
+    for attempt in range(PUBMED_RETRIES):
+        try:
+            # POST, because an efetch id list overruns the URL length limit.
+            resp = requests.post(PUBMED_API + endpoint, data=payload, timeout=60)
+            # NCBI reports rate limiting as 429, but also as a 200 whose body is
+            # {"error": "API rate limit exceeded"}.
+            if resp.status_code == 200 and b"API rate limit exceeded" not in resp.content[:300]:
+                return resp
+        except requests.RequestException:
+            pass
+        time.sleep(min(delay, 30.0))
+        delay *= 2
+    return None
+
+
+def _pubmed_date(article: ET.Element) -> Optional[datetime]:
+    """When the record reached PubMed.
+
+    Not the journal's PubDate: that is an issue date, often weeks in the future for
+    an ahead-of-print paper and sometimes only a year. The "pubmed" history date is
+    always complete, and is the same clock the edat search window runs on.
+    """
+    for status in ("pubmed", "entrez"):
+        node = article.find(f"PubmedData/History/PubMedPubDate[@PubStatus='{status}']")
+        if node is None:
+            continue
+        try:
+            return datetime(int(node.findtext("Year")), int(node.findtext("Month") or 1),
+                            int(node.findtext("Day") or 1), tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _pubmed_text(node: Optional[ET.Element]) -> str:
+    """Flatten an element that may carry inline markup (<i>, <sub>, <sup>)."""
+    return " ".join("".join(node.itertext()).split()) if node is not None else ""
+
+
+def fetch_pubmed(feed: Dict[str, Any]) -> List[Paper]:
+    """Run one PubMed query (feed["term"]) over the lookback window.
+
+    Same contract as the RSS and Crossref paths. Like Crossref, PubMed filters by
+    date server-side, so this sees the whole window, and it returns full abstracts
+    where a publisher RSS feed gives a teaser.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+    budget = int(feed.get("max_items", MAX_ITEMS_PER_FEED))
+
+    # edat = the date the record entered PubMed, which is what "new" means here.
+    resp = _pubmed_request("esearch.fcgi", {
+        "term": feed["term"], "datetype": "edat", "reldate": LOOKBACK_DAYS,
+        "retmax": budget, "retmode": "json",
+    })
+    try:
+        result = resp.json()["esearchresult"] if resp is not None else None
+    except (ValueError, KeyError):
+        result = None
+    if result is None:
+        print(f"  ! PubMed search unavailable after {PUBMED_RETRIES} tries; skipping")
+        return []
+    if result.get("errorlist") or result.get("warninglist"):
+        # A misspelt journal or field tag does not fail: PubMed quietly drops that
+        # clause and answers the rest of the query. Surface it.
+        print(f"  ! PubMed query warning: {result.get('errorlist') or result.get('warninglist')}")
+    ids = result.get("idlist") or []
+    if int(result.get("count") or 0) > len(ids):
+        print(f"  ! {result['count']} matches but max_items is {budget}; raise it to see the rest")
+
+    papers: List[Paper] = []
+    for start in range(0, len(ids), PUBMED_BATCH):
+        time.sleep(PUBMED_PAUSE_SEC)
+        resp = _pubmed_request("efetch.fcgi", {
+            "id": ",".join(ids[start:start + PUBMED_BATCH]), "retmode": "xml",
+        })
+        try:
+            root = ET.fromstring(resp.content) if resp is not None else None
+        except ET.ParseError:
+            root = None
+        if root is None:
+            print(f"  ! PubMed fetch failed for records {start}-{start + PUBMED_BATCH}; "
+                  f"continuing with {len(papers)} item(s)")
+            continue
+
+        for article in root.iter("PubmedArticle"):
+            body = article.find("MedlineCitation/Article")
+            if body is None:
+                continue
+            # A corrigendum repeats the original abstract, so it ranks exactly like
+            # the paper it corrects.
+            kinds = {k.text for k in body.findall("PublicationTypeList/PublicationType")}
+            if kinds & {"Published Erratum", "Retraction of Publication",
+                        "Expression of Concern"}:
+                continue
+            title = _pubmed_text(body.find("ArticleTitle")).rstrip(".")
+            # Structured abstracts arrive as several labelled sections.
+            summary = " ".join(
+                _pubmed_text(part) for part in body.findall("Abstract/AbstractText")
+            ).strip()
+            # No abstract means an erratum, a commentary or a cover caption. With
+            # only a title to embed these rank on noise, so leave them out.
+            if not title or not summary:
+                continue
+            published = _pubmed_date(article)
+            if published is None or published < cutoff:
+                continue
+
+            doi = next(
+                (i.text.strip() for i in article.findall("PubmedData/ArticleIdList/ArticleId")
+                 if i.get("IdType") == "doi" and i.text),
+                "",
+            )
+            pmid = article.findtext("MedlineCitation/PMID", "")
+            authors = []
+            for a in body.findall("AuthorList/Author"):
+                full = " ".join(
+                    x for x in (a.findtext("ForeName"), a.findtext("LastName")) if x
+                ).strip() or (a.findtext("CollectiveName") or "").strip()
+                if full:
+                    authors.append(full)
+
+            paper = Paper(
+                title=title,
+                summary=summary,
+                link=(f"https://doi.org/{doi}" if doi
+                      else f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"),
+                published=published,
+                # The paper's own journal, so a topic search does not label a Nature
+                # paper "PubMed: erythropoiesis".
+                source=(body.findtext("Journal/ISOAbbreviation")
+                        or body.findtext("Journal/Title") or feed["name"]),
+                authors=authors,
+            )
+            if not is_excluded(paper):
+                papers.append(paper)
+
+    return papers
+
+
 # Some publishers serve XML that feedparser's own fetcher rejects outright --
 # Genome Research sends a duplicate "version" attribute and Nature Biotechnology an
 # invalid token -- and feedparser then returns zero entries with bozo set, so those
@@ -1216,10 +1754,12 @@ def _parse_rss(url: str):
 
 
 def fetch_feed(feed: Dict[str, Any]) -> List[Paper]:
-    print(f"Fetching feed: {feed['name']}  ({feed['url']})")
+    print(f"Fetching feed: {feed['name']}  "
+          f"({feed.get('url') or textwrap.shorten(feed.get('term', ''), 80)})")
 
-    if feed.get("type") == "crossref":
-        papers = fetch_crossref(feed)
+    if feed.get("type") in ("crossref", "pubmed"):
+        fetch = fetch_crossref if feed["type"] == "crossref" else fetch_pubmed
+        papers = fetch(feed)
         print(f"  -> kept {len(papers)} items (after exclusions; admission comes later)")
         return papers
 
@@ -1815,7 +2355,13 @@ def main(argv: Optional[List[str]] = None):
     dedup = {}
     for p in fetched:
         dedup.setdefault(paper_key(p), p)
-    fetched = list(dedup.values())
+    # LOCAL: then by title. The PubMed feeds overlap the RSS ones (a topic search
+    # finds the Nature paper the Nature feed already carried) under a different
+    # link, which paper_key treats as a different paper. First fetched wins.
+    by_title = {}
+    for p in dedup.values():
+        by_title.setdefault(title_key(p) or paper_key(p), p)
+    fetched = list(by_title.values())
 
     if not fetched:
         print("No papers found after filtering.")
@@ -1840,6 +2386,15 @@ def main(argv: Optional[List[str]] = None):
     prev_papers = [p for p in prev_papers if p.published >= cutoff]
 
     seen_keys = {paper_key(p) for p in prev_papers}
+
+    # LOCAL: a paper already in the history under another link is the same paper,
+    # not a new one. Drop the fresh copy so the stored one stays in Previous Feed
+    # instead of being announced a second time.
+    prev_by_title = {title_key(p): paper_key(p) for p in prev_papers if title_key(p)}
+    fetched = [
+        p for p in fetched
+        if prev_by_title.get(title_key(p), paper_key(p)) == paper_key(p)
+    ]
 
     yesterday_date = today_date - timedelta(days=1)
 
